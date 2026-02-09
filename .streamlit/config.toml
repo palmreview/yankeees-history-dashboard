@@ -1,0 +1,7 @@
+[theme]
+base="light"
+primaryColor="#0C2340"              # Yankees navy
+backgroundColor="#FFFFFF"
+secondaryBackgroundColor="#F3F5F7"  # Soft gray
+textColor="#111827"
+font="sans serif"
