@@ -20,7 +20,6 @@ def inject_css():
     st.markdown(
         """
         <style>
-        /* Subtle pinstripe background */
         .stApp {
           background-image: repeating-linear-gradient(
             90deg,
@@ -30,7 +29,6 @@ def inject_css():
             rgba(255,255,255,1) 10px
           );
         }
-
         h1, h2, h3 { letter-spacing: 0.3px; }
 
         .season-card {
@@ -82,30 +80,28 @@ def load_lahman_teams(csv_path: str) -> pd.DataFrame:
     if "yearID" in df.columns:
         df["yearID"] = pd.to_numeric(df["yearID"], errors="coerce").astype("Int64")
 
-    # Normalize common postseason flag columns if present
     for col in ["DivWin", "WCWin", "LgWin", "WSWin"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
 
     if "W" in df.columns and "L" in df.columns:
-        denom = (pd.to_numeric(df["W"], errors="coerce") + pd.to_numeric(df["L"], errors="coerce"))
-        df["win_pct"] = (pd.to_numeric(df["W"], errors="coerce") / denom).round(3)
+        w = pd.to_numeric(df["W"], errors="coerce")
+        l = pd.to_numeric(df["L"], errors="coerce")
+        denom = (w + l)
+        df["win_pct"] = (w / denom).round(3)
 
     return df
 
 
 def get_yankees_seasons(df: pd.DataFrame) -> pd.DataFrame:
-    # MVP: Modern Yankees
-    if "teamID" not in df.columns:
+    if "teamID" not in df.columns or "yearID" not in df.columns:
         return pd.DataFrame()
 
     yank = df[df["teamID"] == "NYA"].copy()
+    yank = yank.dropna(subset=["yearID"]).sort_values("yearID", ascending=False)
     if yank.empty:
         return yank
 
-    yank = yank.dropna(subset=["yearID"]).sort_values("yearID", ascending=False)
-
-    # Friendly columns
     def mk_record(r):
         w = r.get("W")
         l = r.get("L")
@@ -139,6 +135,10 @@ def get_yankees_seasons(df: pd.DataFrame) -> pd.DataFrame:
     return yank
 
 
+def decade_label(y: int) -> str:
+    return f"{(y // 10) * 10}s"
+
+
 # -----------------------------
 # Supabase helpers (optional)
 # -----------------------------
@@ -156,7 +156,6 @@ def get_supabase_client():
 
 
 def ensure_user_id() -> str:
-    # MVP identity; later we can add real auth
     if "user_id" not in st.session_state:
         st.session_state.user_id = "default_user"
     return st.session_state.user_id
@@ -253,16 +252,7 @@ def main():
     st.title("Yankees History Timeline")
     st.caption("Seasons-first dashboard — explore seasons, flag favorites, and keep notes. (No logos; just a Yankees vibe.)")
 
-    # Sidebar
-    st.sidebar.header("Timeline Filters")
-
-    # You placed Teams.csv at the ROOT of the GitHub repo:
-    TEAMS_PATH = "Teams.csv"
-
-    start_year = st.sidebar.slider("Start year", 1903, 2025, 1903)
-    decade = st.sidebar.selectbox("Decade", ["All"] + [f"{d}s" for d in range(1900, 2030, 10)], index=0)
-    postseason_only = st.sidebar.checkbox("Postseason seasons only", value=False)
-    ws_titles_only = st.sidebar.checkbox("World Series titles only", value=False)
+    TEAMS_PATH = "Teams.csv"  # you put this at repo root
 
     # Load data
     try:
@@ -275,11 +265,29 @@ def main():
         )
         st.stop()
 
-    yank = get_yankees_seasons(teams)
-    if yank.empty:
-        st.error("No Yankees seasons found. Check that your Lahman Teams.csv is valid and includes teamID = 'NYA'.")
+    all_yank = get_yankees_seasons(teams)
+    if all_yank.empty:
+        st.error("No Yankees seasons found. Check that Teams.csv includes teamID = 'NYA'.")
         st.stop()
 
+    # Build decade options from actual data (prevents empty decades)
+    all_years = all_yank["yearID"].dropna().astype(int).tolist()
+    min_year, max_year = min(all_years), max(all_years)
+
+    decade_options = ["All"]
+    decade_start = (min_year // 10) * 10
+    decade_end = (max_year // 10) * 10
+    decade_options += [f"{d}s" for d in range(decade_start, decade_end + 1, 10)]
+
+    # Sidebar filters
+    st.sidebar.header("Timeline Filters")
+    start_year = st.sidebar.slider("Start year", min_year, max_year, max(1903, min_year))
+    decade = st.sidebar.selectbox("Decade", decade_options, index=0)
+    postseason_only = st.sidebar.checkbox("Postseason seasons only", value=False)
+    ws_titles_only = st.sidebar.checkbox("World Series titles only", value=False)
+
+    # Apply filters
+    yank = all_yank.copy()
     yank = yank[yank["yearID"] >= start_year]
 
     if decade != "All":
@@ -301,6 +309,16 @@ def main():
 
     yank = yank.sort_values("yearID", ascending=False)
 
+    # ✅ Critical fix: handle empty result sets gracefully
+    if yank.empty:
+        st.warning(
+            "No seasons match your filters. Try:\n"
+            "- Lowering Start year\n"
+            "- Setting Decade to All\n"
+            "- Turning off Postseason/WS-only filters"
+        )
+        return
+
     # Supabase
     sb = get_supabase_client()
     user_id = ensure_user_id()
@@ -313,7 +331,7 @@ def main():
             if pd.notna(y):
                 flags_map[int(y)] = r.to_dict()
 
-    # Top KPIs
+    # KPIs
     total_seasons = len(yank)
     total_ws = int((yank.get("WSWin", "") == "Y").sum()) if "WSWin" in yank.columns else 0
     total_post = int((yank["postseason"] != "—").sum())
@@ -326,15 +344,20 @@ def main():
     with k3:
         kpi("World Series titles (in view)", str(total_ws))
 
-    st.markdown("")
-
-    # Layout: left timeline, right details
     left, right = st.columns([1.2, 0.8], gap="large")
+
+    # Safe selected year management
+    years = yank["yearID"].astype(int).tolist()
+    if "selected_year" not in st.session_state or st.session_state.selected_year not in years:
+        st.session_state.selected_year = years[0]
 
     with left:
         st.subheader("Timeline")
-        years = yank["yearID"].astype(int).tolist()
-        selected_year = st.selectbox("Pick a season", years, index=0)
+        st.session_state.selected_year = st.selectbox(
+            "Pick a season",
+            years,
+            index=years.index(st.session_state.selected_year),
+        )
 
         show_n = st.slider("How many seasons to show", 10, min(160, len(yank)), min(30, len(yank)))
         for _, row in yank.head(show_n).iterrows():
@@ -343,14 +366,14 @@ def main():
 
     with right:
         st.subheader("Season Details")
+        year = int(st.session_state.selected_year)
 
-        sel = yank[yank["yearID"].astype(int) == int(selected_year)]
+        sel = yank[yank["yearID"].astype(int) == year]
         if sel.empty:
             st.info("Select a season to see details.")
             return
 
         r = sel.iloc[0]
-        year = int(r["yearID"])
         st.markdown(f"### {year}")
 
         c1, c2, c3 = st.columns(3)
@@ -361,7 +384,6 @@ def main():
         with c3:
             st.metric("Postseason", r.get("postseason", "—"))
 
-        # Snapshot (only show fields present)
         extras = []
         for label, col in [
             ("Finish", "finish"),
@@ -382,7 +404,6 @@ def main():
             for label, val in extras[:12]:
                 st.write(f"- {label}: **{val}**")
 
-        # Notes / flags
         st.markdown("---")
         st.markdown("**Your notes & flags**")
 
@@ -408,14 +429,6 @@ def main():
                 except Exception as e:
                     st.error(f"Save failed: {e}")
 
-        st.markdown("---")
-        with st.expander("Next upgrades (planned)"):
-            st.write("- Era bands (Ruth/Gehrig, DiMaggio, Mantle, Core Four, etc.)")
-            st.write("- Dynasty highlighting + ring counter across all seasons")
-            st.write("- Curated story blurbs per season (short history-first narratives)")
-            st.write("- Season of the Day (daily discovery)")
-
-    # Footer
     st.sidebar.markdown("---")
     st.sidebar.caption("Data: Lahman Baseball Database (Teams.csv).")
 
