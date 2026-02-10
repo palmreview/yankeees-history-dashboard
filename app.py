@@ -1,21 +1,24 @@
 # Yankees History Timeline Dashboard
-# Version: 0.6 (adds Ring Counter; preserves all v0.5 functionality)
-# Date: 2026-02-09
+# Version: 0.7 (adds Dynasty/Era Bands; preserves all v0.6 functionality)
+# Date: 2026-02-10
 #
-# v0.5 functionality preserved:
+# Preserved (v0.5/v0.6):
 # - Loads Lahman Teams.csv from repo root
 # - Seasons-first timeline with decade / start-year filters
 # - Season details view
 # - Optional Supabase persistence (read/favorite/notes) via user_season_flags
+# - Ring Counter (overall + in current filter)
+# - Safe slider (never crashes on small filtered sets)
 #
-# v0.6 adds:
-# - World Series "Ring Counter" (overall + in current filter)
+# Added (v0.7):
+# - Dynasty/Era Bands in timeline (headers + subtle styling)
+# - Era legend (sidebar)
 
 import os
 import pandas as pd
 import streamlit as st
 
-__version__ = "0.6"
+__version__ = "0.7"
 
 # -----------------------------
 # Optional Supabase
@@ -29,7 +32,7 @@ except Exception:
 
 
 # -----------------------------
-# Styling (Yankees vibe)
+# Styling (Yankees vibe + Era styling)
 # -----------------------------
 def inject_css():
     st.markdown(
@@ -44,6 +47,7 @@ def inject_css():
             rgba(255,255,255,1) 10px
           );
         }
+
         .season-card {
           background: rgba(255,255,255,0.95);
           border: 1px solid rgba(12,35,64,0.18);
@@ -52,6 +56,7 @@ def inject_css():
           margin-bottom: 10px;
           box-shadow: 0 6px 18px rgba(17,24,39,0.06);
         }
+
         .pill {
           display:inline-block;
           padding:3px 10px;
@@ -61,24 +66,51 @@ def inject_css():
           font-size:0.75rem;
           margin-right:6px;
           margin-top:6px;
+          white-space: nowrap;
         }
-        .kpi-row {
-          display:flex;
-          gap:12px;
-          flex-wrap:wrap;
-          margin: 6px 0 14px 0;
-        }
+
+        .kpi-row { margin: 6px 0 14px 0; }
         .kpi {
           background: rgba(255,255,255,0.92);
           border: 1px solid rgba(12,35,64,0.18);
           border-radius: 14px;
           padding: 10px 12px;
           box-shadow: 0 6px 18px rgba(17,24,39,0.06);
-          min-width: 180px;
         }
         .kpi-label { font-size: 0.80rem; color: rgba(17,24,39,0.70); }
         .kpi-value { font-size: 1.25rem; font-weight: 800; margin-top: 2px; }
         .kpi-sub { font-size: 0.85rem; color: rgba(17,24,39,0.70); margin-top: 2px; }
+
+        /* Era band header */
+        .era-band {
+          border: 1px solid rgba(12,35,64,0.18);
+          border-radius: 14px;
+          padding: 10px 12px;
+          margin: 14px 0 10px 0;
+          box-shadow: 0 6px 18px rgba(17,24,39,0.05);
+        }
+        .era-title { font-weight: 900; letter-spacing: 0.2px; }
+        .era-years { color: rgba(17,24,39,0.65); font-size: 0.9rem; margin-top: 2px; }
+
+        /* Era-specific subtle tints + left borders */
+        .era-pre  { background: rgba(12,35,64,0.06); border-left: 8px solid rgba(12,35,64,0.35); }
+        .era-ruth { background: rgba(12,35,64,0.08); border-left: 8px solid rgba(12,35,64,0.55); }
+        .era-dim  { background: rgba(12,35,64,0.07); border-left: 8px solid rgba(12,35,64,0.48); }
+        .era-mant { background: rgba(12,35,64,0.06); border-left: 8px solid rgba(12,35,64,0.40); }
+        .era-zoo  { background: rgba(12,35,64,0.05); border-left: 8px solid rgba(12,35,64,0.32); }
+        .era-lean { background: rgba(12,35,64,0.04); border-left: 8px solid rgba(12,35,64,0.26); }
+        .era-core { background: rgba(12,35,64,0.07); border-left: 8px solid rgba(12,35,64,0.52); }
+        .era-mod  { background: rgba(12,35,64,0.05); border-left: 8px solid rgba(12,35,64,0.34); }
+
+        /* Apply era tint to season cards too */
+        .season-era-pre  { border-left: 8px solid rgba(12,35,64,0.35); background: rgba(255,255,255,0.97); }
+        .season-era-ruth { border-left: 8px solid rgba(12,35,64,0.55); background: rgba(255,255,255,0.97); }
+        .season-era-dim  { border-left: 8px solid rgba(12,35,64,0.48); background: rgba(255,255,255,0.97); }
+        .season-era-mant { border-left: 8px solid rgba(12,35,64,0.40); background: rgba(255,255,255,0.97); }
+        .season-era-zoo  { border-left: 8px solid rgba(12,35,64,0.32); background: rgba(255,255,255,0.97); }
+        .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); background: rgba(255,255,255,0.97); }
+        .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); background: rgba(255,255,255,0.97); }
+        .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); background: rgba(255,255,255,0.97); }
         </style>
         """,
         unsafe_allow_html=True,
@@ -100,22 +132,57 @@ def kpi_card(label: str, value: str, sub: str | None = None):
 
 
 # -----------------------------
+# Era Bands (v0.7)
+# -----------------------------
+ERAS = [
+    # key, label, start, end (inclusive), css_class
+    ("pre",  "Early Years (Highlanders / pre-Ruth)", 1903, 1919, "pre"),
+    ("ruth", "Ruth & Gehrig Era",                    1920, 1934, "ruth"),
+    ("dim",  "DiMaggio Era",                         1936, 1951, "dim"),
+    ("mant", "Mantle / 50s–60s Dynasty",             1952, 1964, "mant"),
+    ("zoo",  "Bronx Zoo / Late-70s Rise",            1976, 1981, "zoo"),
+    ("lean", "Lean Years / Mattingly Era",           1982, 1995, "lean"),
+    ("core", "Core Four Era",                        1996, 2009, "core"),
+    ("mod",  "Modern Era",                           2010, 2026, "mod"),
+]
+
+def era_for_year(year: int) -> dict:
+    for key, label, start, end, css in ERAS:
+        if start <= year <= end:
+            return {"key": key, "label": label, "start": start, "end": end, "css": css}
+    # fallback (covers gaps like 1935, 1965–1975, etc.)
+    return {"key": "pre", "label": "Other Years", "start": year, "end": year, "css": "pre"}
+
+
+def render_era_header(era: dict):
+    css = era["css"]
+    label = era["label"]
+    years = f"{era['start']}–{era['end']}" if era["start"] != era["end"] else f"{era['start']}"
+    st.markdown(
+        f"""
+        <div class="era-band era-{css}">
+          <div class="era-title">{label}</div>
+          <div class="era-years">{years}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------
 # Data loading
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
-    # yearID can be int; keep as numeric
     if "yearID" in df.columns:
         df["yearID"] = pd.to_numeric(df["yearID"], errors="coerce")
 
-    # postseason flags
     for col in ["DivWin", "WCWin", "LgWin", "WSWin"]:
         if col in df.columns:
             df[col] = df[col].fillna("")
 
-    # win pct
     if "W" in df.columns and "L" in df.columns:
         w = pd.to_numeric(df["W"], errors="coerce")
         l = pd.to_numeric(df["L"], errors="coerce")
@@ -174,10 +241,6 @@ def get_supabase():
 
 
 def read_flags(sb, user_id: str) -> dict[int, dict]:
-    """
-    Returns dict: {year: row}
-    If table doesn't exist yet, returns empty dict (and warns once).
-    """
     if sb is None:
         return {}
     try:
@@ -191,12 +254,9 @@ def read_flags(sb, user_id: str) -> dict[int, dict]:
                 continue
         return out
     except Exception as e:
-        # Don't crash the whole app if the table isn't created yet.
-        # Common: PGRST205 "Could not find the table ..."
         if "PGRST205" in str(e) or "Could not find the table" in str(e):
-            st.sidebar.warning("Supabase table `user_season_flags` not found yet. Create it in Supabase (SQL) to enable saving.")
+            st.sidebar.warning("Supabase table `user_season_flags` not found yet. Create it to enable saving.")
             return {}
-        # For anything else, surface it (still not removing functionality, just visibility)
         st.sidebar.error(f"Supabase read error: {e}")
         return {}
 
@@ -245,13 +305,18 @@ def main():
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
-    # stable decade list (sorted by decade start)
     decade_starts = sorted({(y // 10) * 10 for y in years_all})
     decade_options = ["All"] + [f"{d}s" for d in decade_starts]
     decade = st.sidebar.selectbox("Decade", decade_options, index=0)
 
     postseason_only = st.sidebar.checkbox("Postseason only", value=False)
     ws_only = st.sidebar.checkbox("World Series titles only", value=False)
+
+    # Era legend (v0.7)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Era bands")
+    for key, label, start, end, css in ERAS:
+        st.sidebar.markdown(f"- **{label}** ({start}–{end})")
 
     # Apply filters
     filtered = yank[yank["yearID"] >= start_year].copy()
@@ -275,16 +340,13 @@ def main():
         st.warning("No seasons match filters.")
         return
 
-    # -----------------------------
-    # v0.6 Ring Counter (overall + in-filter)
-    # -----------------------------
+    # Ring Counter (overall + filtered)
     overall_rings = int((yank["WSWin"] == "Y").sum()) if "WSWin" in yank.columns else 0
     filtered_rings = int((filtered["WSWin"] == "Y").sum()) if "WSWin" in filtered.columns else 0
 
     seasons_in_view = len(filtered)
     postseason_in_view = int((filtered["postseason"] != "—").sum())
 
-    st.markdown("<div class='kpi-row'>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
     with c1:
         kpi_card("🏆 Ring Counter (all time)", f"{overall_rings}", "World Series titles (NYA)")
@@ -292,18 +354,15 @@ def main():
         kpi_card("🏆 Rings (current filters)", f"{filtered_rings}", "Titles in this filtered view")
     with c3:
         kpi_card("Seasons in view", f"{seasons_in_view}", f"Postseason seasons: {postseason_in_view}")
-    st.markdown("</div>", unsafe_allow_html=True)
 
     # Supabase + flags
     sb = get_supabase()
-    user_id = "default_user"  # MVP identity
+    user_id = "default_user"
     flags = read_flags(sb, user_id)
 
-    # Layout
     left, right = st.columns([1.2, 0.8])
 
     years = filtered["yearID"].astype(int).tolist()
-
     if "selected_year" not in st.session_state or st.session_state.selected_year not in years:
         st.session_state.selected_year = years[0]
 
@@ -316,7 +375,7 @@ def main():
             index=years.index(st.session_state.selected_year),
         )
 
-        # Safe slider (never crashes)
+        # Safe slider
         n = len(filtered)
         if n <= 10:
             show_n = n
@@ -329,10 +388,17 @@ def main():
                 value=min(30, min(160, n)),
             )
 
+        # Render era bands + season cards (v0.7)
+        last_era_key = None
         for _, row in filtered.head(show_n).iterrows():
             year = int(row["yearID"])
             record = row.get("record", "—")
             post = row.get("postseason", "—")
+
+            era = era_for_year(year)
+            if era["key"] != last_era_key:
+                render_era_header(era)
+                last_era_key = era["key"]
 
             pills = []
             if row.get("WSWin", "") == "Y":
@@ -350,9 +416,9 @@ def main():
 
             st.markdown(
                 f"""
-                <div class='season-card'>
+                <div class='season-card season-era-{era["css"]}'>
                   <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline;">
-                    <div style="font-size:1.05rem; font-weight:800;">{year}</div>
+                    <div style="font-size:1.05rem; font-weight:900;">{year}</div>
                     <div style="color:rgba(17,24,39,0.70);">{record} · {post}</div>
                   </div>
                   <div style="margin-top:6px;">{pills_html}</div>
@@ -365,7 +431,10 @@ def main():
         year = int(st.session_state.selected_year)
         row = filtered[filtered["yearID"].astype(int) == year].iloc[0]
 
+        era = era_for_year(year)
         st.subheader(f"{year} Season")
+        st.caption(f"Era: **{era['label']}**")
+
         st.metric("Record", row.get("record", "—"))
         st.metric("Win %", row.get("win_pct", "—"))
         st.metric("Postseason", row.get("postseason", "—"))
