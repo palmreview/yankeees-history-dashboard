@@ -1,5 +1,5 @@
 # Yankees History Timeline Dashboard
-# Version: 0.8 (adds Season Stories; preserves all v0.7 functionality)
+# Version: 0.8 (Season Articles 1903–1922 via Chronicling America; preserves all v0.7 functionality)
 # Date: 2026-02-10
 #
 # Preserved:
@@ -12,10 +12,15 @@
 # - Safe slider (never crashes on small filtered sets)
 #
 # Added (v0.8):
-# - Season Stories (read + add) via Supabase table season_stories
-#   Fields: id(uuid), year(int), title(text), story(text), tags(text), source_url(text), created_at
+# - "Articles" panel that auto-fetches historical newspaper pages for seasons 1903–1922
+#   using Chronicling America search results JSON and shows snippet + link.
 
+import json
 import os
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import streamlit as st
 
@@ -33,7 +38,7 @@ except Exception:
 
 
 # -----------------------------
-# Styling
+# Styling (Yankees vibe + Era styling)
 # -----------------------------
 def inject_css():
     st.markdown(
@@ -88,11 +93,12 @@ def inject_css():
           padding: 10px 12px;
           margin: 14px 0 10px 0;
           box-shadow: 0 6px 18px rgba(17,24,39,0.05);
+          background: rgba(255,255,255,0.92);
         }
         .era-title { font-weight: 900; letter-spacing: 0.2px; }
         .era-years { color: rgba(17,24,39,0.65); font-size: 0.9rem; margin-top: 2px; }
 
-        /* Era-specific left borders */
+        /* Era-specific subtle left borders */
         .season-era-pre  { border-left: 8px solid rgba(12,35,64,0.35); }
         .season-era-ruth { border-left: 8px solid rgba(12,35,64,0.55); }
         .season-era-dim  { border-left: 8px solid rgba(12,35,64,0.48); }
@@ -101,6 +107,18 @@ def inject_css():
         .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); }
         .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); }
         .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); }
+
+        .article-card {
+          border: 1px solid rgba(12,35,64,0.14);
+          border-radius: 14px;
+          padding: 12px 12px;
+          margin: 10px 0;
+          background: rgba(255,255,255,0.95);
+          box-shadow: 0 6px 18px rgba(17,24,39,0.04);
+        }
+        .article-title { font-weight: 800; }
+        .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 2px; }
+        .article-snippet { margin-top: 8px; color: rgba(17,24,39,0.85); }
         </style>
         """,
         unsafe_allow_html=True,
@@ -263,46 +281,146 @@ def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
 
 
 # -----------------------------
-# Stories (v0.8)
+# Chronicling America articles (v0.8)
 # -----------------------------
-def read_stories_for_year(sb, year: int) -> list[dict]:
-    if sb is None:
-        return []
-    try:
-        resp = (
-            sb.table("season_stories")
-            .select("id,year,title,story,tags,source_url,created_at")
-            .eq("year", int(year))
-            .order("created_at", desc=True)
-            .execute()
-        )
-        return resp.data or []
-    except Exception as e:
-        if "PGRST205" in str(e) or "Could not find the table" in str(e):
-            st.warning("Stories table `season_stories` not found yet. Create it in Supabase to enable stories.")
-            return []
-        st.error(f"Supabase read error (stories): {e}")
-        return []
+CHRONAM_BASE = "https://chroniclingamerica.loc.gov/search/pages/results/"
+
+def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8)"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
 
 
-def add_story(sb, year: int, title: str, story: str, tags: str, source_url: str):
-    if sb is None:
-        return
-    payload = {
-        "year": int(year),
-        "title": title.strip(),
-        "story": story.strip(),
-        "tags": tags.strip(),
-        "source_url": source_url.strip(),
+@st.cache_data(show_spinner=False)
+def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
+    """
+    Searches Chronicling America pages for a year range (same year) and query terms.
+    Returns list of item dicts.
+    API style is the /search/pages/results endpoint with format=json. :contentReference[oaicite:1]{index=1}
+    """
+    params = {
+        "dateFilterType": "yearRange",
+        "date1": str(year),
+        "date2": str(year),
+        "rows": str(rows),
+        "searchType": "advanced",
+        "format": "json",
+        # Use 'andtext' for AND terms (space-separated becomes +)
+        "andtext": query,
     }
-    sb.table("season_stories").insert(payload).execute()
+    url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
+    data = _fetch_json(url)
+    # Chronicling America search returns 'items' array (older style), but keep defensive.
+    items = data.get("items")
+    if isinstance(items, list):
+        return items
+    # Sometimes 'results' may appear in other structures; fallback
+    results = data.get("results")
+    if isinstance(results, list):
+        return results
+    return []
 
 
-def normalize_tags(tags_str: str) -> list[str]:
-    if not tags_str:
-        return []
-    parts = [t.strip().lower() for t in tags_str.split(",")]
-    return [p for p in parts if p]
+def pick_default_queries(year: int) -> List[str]:
+    """
+    Keep it simple: 2–3 preset searches per year.
+    1903–1912: Highlanders era name frequently used.
+    """
+    if year <= 1912:
+        return [
+            "highlanders",
+            "new york highlanders",
+            "yankees",
+        ]
+    return [
+        "yankees",
+        "new york yankees",
+        "baseball yankees",
+    ]
+
+
+def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Normalizes a CA item to consistent fields for display.
+    Typical fields in CA items include: title, date, edition, sequence, url, id, snip.
+    """
+    date = str(item.get("date") or item.get("issue_date") or "")
+    paper = str(item.get("newspaper") or item.get("title") or item.get("publisher") or "Newspaper")
+    # 'title' in CA items is sometimes paper title, so also check 'headline' or 'ocr_eng' isn't a title.
+    headline = str(item.get("headline") or item.get("place_of_publication") or "Newspaper page")
+    url = str(item.get("url") or item.get("id") or "")
+    snippet = str(item.get("snip") or item.get("snippet") or item.get("ocr_eng") or "")
+
+    # Keep snippet short for UI
+    if len(snippet) > 380:
+        snippet = snippet[:380].rstrip() + "…"
+
+    return {
+        "date": date,
+        "paper": paper,
+        "headline": headline,
+        "url": url,
+        "snippet": snippet,
+    }
+
+
+def display_articles_panel(year: int):
+    st.markdown("### Articles (1903–1922)")
+
+    if year < 1903 or year > 1922:
+        st.info("Articles are enabled for **1903–1922** right now. (We’ll expand later once we pick the next archive source.)")
+        return
+
+    defaults = pick_default_queries(year)
+    preset = st.selectbox("Preset searches", defaults, index=0)
+
+    custom = st.text_input(
+        "Add/override search terms (optional)",
+        value="",
+        help="Tip: keep it short (e.g., 'highlanders' or 'babe ruth').",
+    )
+    query = custom.strip() if custom.strip() else preset
+
+    rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
+
+    with st.spinner("Searching newspaper pages…"):
+        try:
+            items = chronam_search(year, query=query, rows=rows)
+        except Exception as e:
+            st.error(f"Could not fetch articles: {e}")
+            return
+
+    if not items:
+        st.warning("No results found for that query. Try different terms.")
+        return
+
+    st.caption("Results are digitized newspaper *pages* with OCR snippets. Click through to view the scan.")
+
+    for it in items:
+        a = normalize_article_item(it)
+        date = a["date"] or "Unknown date"
+        paper = a["paper"] or "Newspaper"
+        url = a["url"]
+        snippet = a["snippet"] or ""
+
+        # Build a nicer label: some CA items use 'title' as newspaper title; treat as paper name.
+        top_line = f"{date} • {paper}"
+        link = f"[Open page]({url})" if url else ""
+
+        st.markdown(
+            f"""
+            <div class="article-card">
+              <div class="article-title">{top_line}</div>
+              <div class="article-meta">{link}</div>
+              <div class="article-snippet">{snippet if snippet else "<i>No OCR snippet available.</i>"}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # -----------------------------
@@ -327,213 +445,11 @@ def main():
         st.error("No Yankees seasons found (teamID='NYA'). Check your Teams.csv.")
         st.stop()
 
+    # Sidebar filters
     years_all = yank["yearID"].dropna().astype(int).tolist()
     min_year, max_year = min(years_all), max(years_all)
 
-    # Sidebar filters
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
-    decade_starts = sorted({(y // 10) * 10 for y in years_all})
-    decade_options = ["All"] + [f"{d}s" for d in decade_starts]
-    decade = st.sidebar.selectbox("Decade", decade_options, index=0)
-
-    postseason_only = st.sidebar.checkbox("Postseason only", value=False)
-    ws_only = st.sidebar.checkbox("World Series titles only", value=False)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Era bands")
-    for _, label, start, end, _css in ERAS:
-        st.sidebar.markdown(f"- **{label}** ({start}–{end})")
-
-    # Apply filters
-    filtered = yank[yank["yearID"] >= start_year].copy()
-
-    if decade != "All":
-        d0 = int(decade[:4])
-        filtered = filtered[(filtered["yearID"] >= d0) & (filtered["yearID"] <= d0 + 9)]
-
-    if postseason_only:
-        filtered = filtered[filtered["postseason"] != "—"]
-
-    if ws_only:
-        filtered = filtered[filtered["WSWin"] == "Y"] if "WSWin" in filtered.columns else filtered.iloc[0:0]
-
-    filtered = filtered.sort_values("yearID", ascending=False)
-
-    if filtered.empty:
-        st.warning("No seasons match filters.")
-        return
-
-    # Ring counters
-    overall_rings = int((yank["WSWin"] == "Y").sum()) if "WSWin" in yank.columns else 0
-    filtered_rings = int((filtered["WSWin"] == "Y").sum()) if "WSWin" in filtered.columns else 0
-    seasons_in_view = len(filtered)
-    postseason_in_view = int((filtered["postseason"] != "—").sum())
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        kpi_card("🏆 Ring Counter (all time)", f"{overall_rings}", "World Series titles (NYA)")
-    with c2:
-        kpi_card("🏆 Rings (current filters)", f"{filtered_rings}", "Titles in this filtered view")
-    with c3:
-        kpi_card("Seasons in view", f"{seasons_in_view}", f"Postseason seasons: {postseason_in_view}")
-
-    # Supabase + persistence
-    sb = get_supabase()
-    user_id = "default_user"
-    flags = read_flags(sb, user_id)
-
-    left, right = st.columns([1.2, 0.8])
-
-    years = filtered["yearID"].astype(int).tolist()
-    if "selected_year" not in st.session_state or st.session_state.selected_year not in years:
-        st.session_state.selected_year = years[0]
-
-    with left:
-        st.subheader("Timeline")
-
-        st.session_state.selected_year = st.selectbox(
-            "Select season",
-            years,
-            index=years.index(st.session_state.selected_year),
-        )
-
-        # Safe slider
-        n = len(filtered)
-        if n <= 10:
-            show_n = n
-            st.caption(f"Showing all {n} seasons (filtered).")
-        else:
-            show_n = st.slider(
-                "How many seasons to show",
-                min_value=10,
-                max_value=min(160, n),
-                value=min(30, min(160, n)),
-            )
-
-        # Render era bands + season cards
-        last_era_key = None
-        for _, row in filtered.head(show_n).iterrows():
-            year = int(row["yearID"])
-            record = row.get("record", "—")
-            post = row.get("postseason", "—")
-
-            era = era_for_year(year)
-            if era["key"] != last_era_key:
-                render_era_header(era)
-                last_era_key = era["key"]
-
-            pills = []
-            if row.get("WSWin", "") == "Y":
-                pills.append("<span class='pill'>🏆 WS Champs</span>")
-            if post != "—":
-                pills.append(f"<span class='pill'>Postseason: {post}</span>")
-
-            yr_flags = flags.get(year, {})
-            if yr_flags.get("is_favorite"):
-                pills.append("<span class='pill'>★ Favorite</span>")
-            if yr_flags.get("is_read"):
-                pills.append("<span class='pill'>✓ Read</span>")
-
-            pills_html = "".join(pills) if pills else "<span style='color:rgba(17,24,39,0.65)'>No flags</span>"
-
-            st.markdown(
-                f"""
-                <div class='season-card season-era-{era["css"]}'>
-                  <div style="display:flex; justify-content:space-between; gap:10px; align-items:baseline;">
-                    <div style="font-size:1.05rem; font-weight:900;">{year}</div>
-                    <div style="color:rgba(17,24,39,0.70);">{record} · {post}</div>
-                  </div>
-                  <div style="margin-top:6px;">{pills_html}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    with right:
-        year = int(st.session_state.selected_year)
-        row = filtered[filtered["yearID"].astype(int) == year].iloc[0]
-        era = era_for_year(year)
-
-        st.subheader(f"{year} Season")
-        st.caption(f"Era: **{era['label']}**")
-
-        st.metric("Record", row.get("record", "—"))
-        st.metric("Win %", row.get("win_pct", "—"))
-        st.metric("Postseason", row.get("postseason", "—"))
-
-        # Flags/notes
-        st.markdown("---")
-        st.markdown("### Your flags & notes")
-
-        existing = flags.get(year, {})
-        read = st.checkbox("Read", value=bool(existing.get("is_read", False)))
-        fav = st.checkbox("Favorite", value=bool(existing.get("is_favorite", False)))
-        notes = st.text_area("Notes", value=existing.get("notes", ""), height=100)
-
-        if sb is None:
-            st.warning("Supabase not configured. Add SUPABASE_URL and SUPABASE_KEY in Streamlit Cloud secrets to enable saving.")
-        else:
-            if st.button("Save flags/notes", use_container_width=True):
-                try:
-                    save_flag(sb, user_id, year, read, fav, notes)
-                    st.success("Saved flags/notes!")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
-
-        # Stories (v0.8)
-        st.markdown("---")
-        st.markdown("### Stories")
-
-        stories = read_stories_for_year(sb, year) if sb is not None else []
-        all_tags = sorted({t for s in stories for t in normalize_tags(s.get("tags", ""))})
-
-        if stories:
-            tag_filter = st.selectbox("Filter by tag", ["All"] + all_tags, index=0)
-            for s in stories:
-                tags = normalize_tags(s.get("tags", ""))
-                if tag_filter != "All" and tag_filter.lower() not in tags:
-                    continue
-
-                with st.expander(s.get("title", "Untitled story"), expanded=False):
-                    st.write(s.get("story", ""))
-                    meta_bits = []
-                    if s.get("tags"):
-                        meta_bits.append(f"**Tags:** {s.get('tags')}")
-                    if s.get("source_url"):
-                        meta_bits.append(f"**Source:** {s.get('source_url')}")
-                    if meta_bits:
-                        st.markdown("  \n".join(meta_bits))
-        else:
-            st.info("No stories yet for this season. Add the first one below.")
-
-        # Add story form
-        st.markdown("#### Add a story")
-        with st.form(key="add_story_form", clear_on_submit=True):
-            title = st.text_input("Title", placeholder="e.g., 'Turning point season' or 'Iconic moment'")
-            story_text = st.text_area("Story (2–6 sentences)", height=140, placeholder="Write a short narrative. Keep it readable.")
-            tags = st.text_input("Tags (comma-separated)", placeholder="e.g., dynasty, rivalry, rookie, pitching")
-            source_url = st.text_input("Source URL (optional)", placeholder="Paste a link if you used one")
-            submitted = st.form_submit_button("Add story")
-
-        if submitted:
-            if sb is None:
-                st.error("Supabase isn’t configured yet, so stories can’t be saved.")
-            else:
-                if not title.strip() or not story_text.strip():
-                    st.error("Please enter at least a Title and Story.")
-                else:
-                    try:
-                        add_story(sb, year, title, story_text, tags, source_url)
-                        st.success("Story added!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Could not add story: {e}")
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Data: Lahman Teams.csv (repo root)")
-
-
-if __name__ == "__main__":
-    main()
+    decade_starts = sorted({(y // 10) * 10 for y in years*_
