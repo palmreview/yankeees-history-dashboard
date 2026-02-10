@@ -1,861 +1,742 @@
+# Yankees History Timeline Dashboard
+# Version: 0.8 (Season Articles 1903–1922 via Chronicling America; preserves all v0.7 functionality)
+# Date: 2026-02-10
+#
+# Preserved:
+# - Loads Lahman Teams.csv from repo root
+# - Seasons-first timeline with decade / start-year filters
+# - Season details view
+# - Optional Supabase persistence (read/favorite/notes) via user_season_flags
+# - Ring Counter (overall + in current filter)
+# - Dynasty/Era bands in timeline
+# - Safe selection (never crashes on small filtered sets)
+#
+# Added (v0.8):
+# - "Articles" panel that auto-fetches historical newspaper pages for seasons 1903–1922
+#   using Chronicling America search results JSON and shows snippet + link.
 
 import json
-import re
-import sqlite3
-from datetime import datetime
-from pathlib import Path
-from urllib.parse import urlencode, quote
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-from zoneinfo import ZoneInfo
+import os
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-# ============================
-# Arcade Game Picker
-# v1.7-stable + Marquees + Extra Statuses + Supabase-first persistence
-# ============================
+__version__ = "0.8"
 
-st.set_page_config(page_title="Arcade Game Picker", layout="wide")
+# -----------------------------
+# Optional Supabase
+# -----------------------------
+SUPABASE_ENABLED = False
+try:
+    from supabase import create_client  # type: ignore
 
-# ----------------------------
-# Constants / Config
-# ----------------------------
-TZ = ZoneInfo("America/New_York")
+    SUPABASE_ENABLED = True
+except Exception:
+    SUPABASE_ENABLED = False
 
-CSV_PATH = "arcade_games_1978_2008_clean.csv"
-DB_PATH = "game_state.db"
 
-# Cloudflare R2 Public Dev URL (bucket root)
-# Files expected at:
-#   {R2_PUBLIC_ROOT}/<rom>.png
-#   {R2_PUBLIC_ROOT}/default.png
-R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
+# -----------------------------
+# Styling (Yankees vibe + Era styling)
+# -----------------------------
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        .stApp {
+          background-image: repeating-linear-gradient(
+            90deg,
+            rgba(12,35,64,0.03),
+            rgba(12,35,64,0.03) 2px,
+            rgba(255,255,255,1) 2px,
+            rgba(255,255,255,1) 10px
+          );
+        }
 
-APP_VERSION = (
-    "1.7-stable+ • Adds: Marquees (R2 root), Don't have ROM, Not playable, Want export • "
-    "ADB on-demand • Supabase-first status persistence (SQLite fallback)"
-)
+        .season-card {
+          background: rgba(255,255,255,0.95);
+          border: 1px solid rgba(12,35,64,0.18);
+          border-radius: 14px;
+          padding: 14px;
+          margin-bottom: 10px;
+          box-shadow: 0 6px 18px rgba(17,24,39,0.06);
+        }
 
-STATUS_WANT = "want_to_play"
-STATUS_PLAYED = "played"
-STATUS_NO_ROM = "dont_have_rom"
-STATUS_NOT_PLAYABLE = "not_playable"
+        .pill {
+          display:inline-block;
+          padding:3px 10px;
+          border-radius:999px;
+          border:1px solid rgba(12,35,64,0.25);
+          background:rgba(12,35,64,0.06);
+          font-size:0.75rem;
+          margin-right:6px;
+          margin-top:6px;
+          white-space: nowrap;
+        }
 
-STATUS_LABELS = {
-    None: "—",
-    STATUS_WANT: "⏳ Want to Play",
-    STATUS_PLAYED: "✅ Played",
-    STATUS_NO_ROM: "🧩 Don't have ROM",
-    STATUS_NOT_PLAYABLE: "🚫 Not playable",
-}
+        .kpi {
+          background: rgba(255,255,255,0.92);
+          border: 1px solid rgba(12,35,64,0.18);
+          border-radius: 14px;
+          padding: 10px 12px;
+          box-shadow: 0 6px 18px rgba(17,24,39,0.06);
+        }
+        .kpi-label { font-size: 0.80rem; color: rgba(17,24,39,0.70); }
+        .kpi-value { font-size: 1.25rem; font-weight: 800; margin-top: 2px; }
+        .kpi-sub { font-size: 0.85rem; color: rgba(17,24,39,0.70); margin-top: 2px; }
 
-# ----------------------------
-# UI Header
-# ----------------------------
-st.title("🕹️ Arcade Game Picker (1978–2008)")
-st.caption(
-    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "ADB details/artwork load on-demand. Marquees load from Cloudflare R2. "
-    "Statuses persist in Supabase when configured (SQLite fallback)."
-)
+        /* Era band header */
+        .era-band {
+          border: 1px solid rgba(12,35,64,0.18);
+          border-radius: 14px;
+          padding: 10px 12px;
+          margin: 14px 0 10px 0;
+          box-shadow: 0 6px 18px rgba(17,24,39,0.05);
+          background: rgba(255,255,255,0.92);
+        }
+        .era-title { font-weight: 900; letter-spacing: 0.2px; }
+        .era-years { color: rgba(17,24,39,0.65); font-size: 0.9rem; margin-top: 2px; }
 
-# ----------------------------
-# Cabinet profile + strict compatibility
-# ----------------------------
-CABINET_SUMMARY = (
-    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, NO spinner/trackball/lightgun/wheel, "
-    "horizontal monitor (vertical OK)."
-)
+        /* Era-specific subtle left borders */
+        .season-era-pre  { border-left: 8px solid rgba(12,35,64,0.35); }
+        .season-era-ruth { border-left: 8px solid rgba(12,35,64,0.55); }
+        .season-era-dim  { border-left: 8px solid rgba(12,35,64,0.48); }
+        .season-era-mant { border-left: 8px solid rgba(12,35,64,0.40); }
+        .season-era-zoo  { border-left: 8px solid rgba(12,35,64,0.32); }
+        .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); }
+        .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); }
+        .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); }
 
-BLOCKED_GENRE_EXACT = {
-    "trackball",
-    "dial/paddle",
-    "dial",
-    "paddle",
-    "lightgun shooter",
-    "gambling",
-    "casino",
-    "quiz",
-}
+        .article-card {
+          border: 1px solid rgba(12,35,64,0.14);
+          border-radius: 14px;
+          padding: 12px 12px;
+          margin: 10px 0;
+          background: rgba(255,255,255,0.95);
+          box-shadow: 0 6px 18px rgba(17,24,39,0.04);
+        }
+        .article-title { font-weight: 800; }
+        .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 2px; }
+        .article-snippet { margin-top: 8px; color: rgba(17,24,39,0.85); }
 
-BLOCKED_GENRE_CONTAINS = [
-    "driving",
-    "racing",
-    "pinball",
-    "redemption",
+        .small-note { color: rgba(17,24,39,0.65); font-size: 0.9rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def kpi_card(label: str, value: str, sub: str | None = None):
+    sub_html = f"<div class='kpi-sub'>{sub}</div>" if sub else ""
+    st.markdown(
+        f"""
+        <div class="kpi">
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
+          {sub_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------
+# Era Bands
+# -----------------------------
+ERAS = [
+    ("pre", "Early Years (Highlanders / pre-Ruth)", 1903, 1919, "pre"),
+    ("ruth", "Ruth & Gehrig Era", 1920, 1934, "ruth"),
+    ("dim", "DiMaggio Era", 1936, 1951, "dim"),
+    ("mant", "Mantle / 50s–60s Dynasty", 1952, 1964, "mant"),
+    ("zoo", "Bronx Zoo / Late-70s Rise", 1976, 1981, "zoo"),
+    ("lean", "Lean Years / Mattingly Era", 1982, 1995, "lean"),
+    ("core", "Core Four Era", 1996, 2009, "core"),
+    ("mod", "Modern Era", 2010, 2026, "mod"),
 ]
 
-BLOCKED_TITLE_HINTS = [
-    "lightgun",
-    "light gun",
-    "trackball",
-    "spinner",
-    "steering",
-    "wheel",
-    "pedal",
-    "paddle",
-]
 
-# ----------------------------
-# Helpers: normalization / dataset
-# ----------------------------
-def normalize_str(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+def era_for_year(year: int) -> dict:
+    for key, label, start, end, css in ERAS:
+        if start <= year <= end:
+            return {"key": key, "label": label, "start": start, "end": end, "css": css}
+    return {"key": "pre", "label": "Other Years", "start": year, "end": year, "css": "pre"}
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["rom", "game", "year", "company", "genre", "platform"]:
-        if col not in df.columns:
-            df[col] = ""
 
-    df["rom"] = df["rom"].map(normalize_str).str.lower()
-    df["game"] = df["game"].map(normalize_str)
-    df["company"] = df["company"].map(normalize_str)
-    df["genre"] = df["genre"].map(normalize_str)
-    df["platform"] = df["platform"].map(normalize_str)
+def render_era_header(era: dict):
+    years = f"{era['start']}–{era['end']}" if era["start"] != era["end"] else f"{era['start']}"
+    st.markdown(
+        f"""
+        <div class="era-band">
+          <div class="era-title">{era['label']}</div>
+          <div class="era-years">{years}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df = df.dropna(subset=["game", "year"]).copy()
-    df["year"] = df["year"].astype(int)
 
-    df["_game_l"] = df["game"].astype(str).str.lower()
-    df["_genre_l"] = df["genre"].astype(str).str.lower()
-    df["_platform_l"] = df["platform"].astype(str).str.lower()
-    df["_company_l"] = df["company"].astype(str).str.lower()
+# -----------------------------
+# Data loading
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    if "yearID" in df.columns:
+        df["yearID"] = pd.to_numeric(df["yearID"], errors="coerce")
+
+    for col in ["DivWin", "WCWin", "LgWin", "WSWin"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+
+    if "W" in df.columns and "L" in df.columns:
+        w = pd.to_numeric(df["W"], errors="coerce")
+        l = pd.to_numeric(df["L"], errors="coerce")
+        df["win_pct"] = (w / (w + l)).round(3)
+
     return df
 
-def load_games_no_cache() -> pd.DataFrame:
-    df = pd.read_csv(CSV_PATH)
-    return ensure_columns(df)
 
-def is_cabinet_compatible_strict(row: pd.Series) -> bool:
-    genre = normalize_str(row.get("genre", "")).strip().lower()
-    title = normalize_str(row.get("game", "")).strip().lower()
-    platform = normalize_str(row.get("platform", "")).strip().lower()
+def get_yankees(df: pd.DataFrame) -> pd.DataFrame:
+    if "teamID" not in df.columns:
+        return pd.DataFrame()
 
-    if not genre and not title:
-        return False
+    yank = df[df["teamID"] == "NYA"].copy()
+    if yank.empty:
+        return yank
 
-    if genre in BLOCKED_GENRE_EXACT:
-        return False
+    yank = yank.dropna(subset=["yearID"]).sort_values("yearID", ascending=False)
 
-    for frag in BLOCKED_GENRE_CONTAINS:
-        if frag in genre:
-            return False
-
-    if any(x in platform for x in ("gambling", "casino", "slot", "quiz")):
-        return False
-
-    for hint in BLOCKED_TITLE_HINTS:
-        if hint in title:
-            return False
-
-    return True
-
-# ----------------------------
-# Supabase (REST) - status persistence
-# ----------------------------
-def _get_secret(name: str) -> str | None:
-    try:
-        val = st.secrets.get(name)
-    except Exception:
-        val = None
-    if val is None:
-        val = st.session_state.get(name)
-    if val is None:
-        val = None
-    if isinstance(val, str):
-        val = val.strip()
-    return val or None
-
-def supabase_enabled() -> bool:
-    url = _get_secret("SUPABASE_URL")
-    key = _get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY")
-    return bool(url) and bool(key)
-
-def _sb_base() -> str:
-    return (_get_secret("SUPABASE_URL") or "").rstrip("/")
-
-def _sb_key() -> str:
-    return (_get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY") or "").strip()
-
-def _sb_headers(extra: dict | None = None) -> dict:
-    key = _sb_key()
-    h = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    if extra:
-        h.update(extra)
-    return h
-
-def supabase_get_all_statuses(table: str = "game_status") -> dict[str, str]:
-    url = f"{_sb_base()}/rest/v1/{table}?select=rom,status"
-    req = Request(url, headers=_sb_headers(), method="GET")
-    with urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    out: dict[str, str] = {}
-    if isinstance(data, list):
-        for row in data:
-            rom = (row.get("rom") or "").strip().lower()
-            if rom:
-                out[rom] = row.get("status")
-    return out
-
-def supabase_set_status(rom: str, status: str | None, table: str = "game_status") -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    base = _sb_base()
-    headers = _sb_headers()
-
-    if status is None:
-        # Delete row
-        url = f"{base}/rest/v1/{table}?rom=eq.{quote(rom)}"
-        req = Request(url, headers=headers, method="DELETE")
-        with urlopen(req, timeout=15):
-            return
-
-    # Upsert row
-    url = f"{base}/rest/v1/{table}"
-    body = json.dumps({"rom": rom, "status": status}).encode("utf-8")
-    headers2 = _sb_headers({"Prefer": "resolution=merge-duplicates"})
-    req = Request(url, data=body, headers=headers2, method="POST")
-    with urlopen(req, timeout=15):
-        return
-
-# ----------------------------
-# SQLite fallback (local / no secrets)
-# ----------------------------
-def get_db() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_sqlite_db() -> None:
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS game_status (
-            rom TEXT PRIMARY KEY,
-            status TEXT,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-def sqlite_get_all_statuses() -> dict[str, str]:
-    conn = get_db()
-    cur = conn.execute("SELECT rom, status FROM game_status")
-    rows = cur.fetchall()
-    conn.close()
-    out = {}
-    for rom, status in rows:
-        if rom:
-            out[str(rom).strip().lower()] = status
-    return out
-
-def sqlite_set_status(rom: str, status: str | None) -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    conn = get_db()
-    if status is None:
-        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-    else:
-        conn.execute(
-            """
-            INSERT INTO game_status (rom, status, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(rom) DO UPDATE SET
-                status=excluded.status,
-                updated_at=datetime('now')
-            """,
-            (rom, status),
-        )
-    conn.commit()
-    conn.close()
-
-# Unified status API
-def get_all_statuses() -> dict[str, str]:
-    if supabase_enabled():
-        try:
-            return supabase_get_all_statuses()
-        except Exception:
-            # fall back silently
-            return sqlite_get_all_statuses()
-    return sqlite_get_all_statuses()
-
-def set_status(rom: str, status: str | None) -> None:
-    if supabase_enabled():
-        try:
-            return supabase_set_status(rom, status)
-        except Exception:
-            return sqlite_set_status(rom, status)
-    return sqlite_set_status(rom, status)
-
-# ----------------------------
-# Session state
-# ----------------------------
-def init_state():
-    if "picked_rows" not in st.session_state:
-        st.session_state.picked_rows = []
-    if "selected_key" not in st.session_state:
-        st.session_state.selected_key = None
-    if "adb_cache" not in st.session_state:
-        st.session_state.adb_cache = {}
-    if "status_cache" not in st.session_state:
-        st.session_state.status_cache = {}
-    if "status_cache_loaded" not in st.session_state:
-        st.session_state.status_cache_loaded = False
-
-    # Marquee caches
-    if "marquee_bytes_cache" not in st.session_state:
-        # url -> bytes or None
-        st.session_state.marquee_bytes_cache = {}
-    if "marquee_exists_cache" not in st.session_state:
-        # rom -> bool
-        st.session_state.marquee_exists_cache = {}
-
-def load_status_cache_once():
-    if not st.session_state.status_cache_loaded:
-        st.session_state.status_cache = get_all_statuses()
-        st.session_state.status_cache_loaded = True
-
-def status_for_rom(rom: str) -> str | None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return None
-    return st.session_state.status_cache.get(rom)
-
-def update_status(rom: str, new_status: str | None):
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    set_status(rom, new_status)
-    if new_status is None:
-        st.session_state.status_cache.pop(rom, None)
-    else:
-        st.session_state.status_cache[rom] = new_status
-
-# ----------------------------
-# Links
-# ----------------------------
-def build_links(game_name: str):
-    q = game_name.replace(" ", "+")
-    return {
-        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
-        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
-        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
-        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
-        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
-    }
-
-def game_key(row: pd.Series) -> str:
-    rom = normalize_str(row.get("rom", "")).lower()
-    if rom:
-        return f"rom:{rom}"
-    return (
-        f"meta:{normalize_str(row.get('game',''))}|"
-        f"{int(row.get('year',0))}|"
-        f"{normalize_str(row.get('company',''))}"
+    yank["record"] = yank.apply(
+        lambda r: f"{int(r['W'])}-{int(r['L'])}"
+        if pd.notna(r.get("W")) and pd.notna(r.get("L"))
+        else "—",
+        axis=1,
     )
 
-# ----------------------------
-# Export: Want to Play
-# ----------------------------
-def build_want_to_play_txt(df: pd.DataFrame) -> str:
-    want_roms = {rom for rom, status in st.session_state.status_cache.items() if status == STATUS_WANT}
-    if not want_roms:
-        return "No games marked as Want to Play."
+    def postseason(r):
+        flags = []
+        if r.get("WCWin") == "Y":
+            flags.append("WC")
+        if r.get("DivWin") == "Y":
+            flags.append("DIV")
+        if r.get("LgWin") == "Y":
+            flags.append("AL")
+        if r.get("WSWin") == "Y":
+            flags.append("WS")
+        return " · ".join(flags) if flags else "—"
 
-    subset = df[df["rom"].isin(want_roms)].copy().sort_values(["year", "game"])
-    lines: list[str] = []
-    for _, row in subset.iterrows():
-        game = row.get("game", "")
-        year = row.get("year", "")
-        company = row.get("company", "")
-        genre = row.get("genre", "")
-        rom = row.get("rom", "")
-        lines.append(f"{game} ({year}) — {company} — {genre} — ROM: {rom}")
-    return "\n".join(lines)
+    yank["postseason"] = yank.apply(postseason, axis=1)
+    return yank
 
-# ----------------------------
-# Streamlit image helper (compat)
-# ----------------------------
-def _st_image(data, *, caption: str | None = None):
+
+# -----------------------------
+# Supabase helpers
+# -----------------------------
+def get_supabase():
+    if not SUPABASE_ENABLED:
+        return None
+    url = st.secrets.get("SUPABASE_URL", "").strip()
+    key = st.secrets.get("SUPABASE_KEY", "").strip()
+    if not url or not key:
+        return None
     try:
-        st.image(data, caption=caption, use_container_width=True)
-    except TypeError:
-        st.image(data, caption=caption, use_column_width=True)
-
-# ----------------------------
-# Marquees (R2) - fetch bytes for reliability
-# ----------------------------
-def marquee_url(rom: str) -> str:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return f"{R2_PUBLIC_ROOT}/default.png"
-    return f"{R2_PUBLIC_ROOT}/{rom}.png"
-
-def default_marquee_url() -> str:
-    return f"{R2_PUBLIC_ROOT}/default.png"
-
-def fetch_image_bytes(url: str, timeout_sec: int = 10) -> bytes | None:
-    cache: dict = st.session_state.marquee_bytes_cache
-    if url in cache:
-        return cache[url]
-    try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (ArcadeGamePicker)"}, method="GET")
-        with urlopen(req, timeout=timeout_sec) as resp:
-            b = resp.read()
-        cache[url] = b
-        return b
+        return create_client(url, key)
     except Exception:
-        cache[url] = None
         return None
 
-def show_marquee(rom: str, enabled: bool = True):
-    if not enabled:
+
+def read_flags(sb, user_id: str) -> dict[int, dict]:
+    if sb is None:
+        return {}
+    try:
+        resp = sb.table("user_season_flags").select("*").eq("user_id", user_id).execute()
+        data = resp.data or []
+        out: dict[int, dict] = {}
+        for r in data:
+            try:
+                out[int(r["year"])] = r
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        if "PGRST205" in str(e) or "Could not find the table" in str(e):
+            st.sidebar.warning("Supabase table `user_season_flags` not found yet. Create it to enable saving flags.")
+            return {}
+        st.sidebar.error(f"Supabase read error (flags): {e}")
+        return {}
+
+
+def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
+    if sb is None:
         return
-    rom = (rom or "").strip().lower()
+    sb.table("user_season_flags").upsert(
+        {
+            "user_id": user_id,
+            "year": int(year),
+            "is_read": bool(read),
+            "is_favorite": bool(fav),
+            "notes": notes or "",
+        },
+        on_conflict="user_id,year",
+    ).execute()
 
-    # Try ROM image; fallback to default
-    if rom:
-        b = fetch_image_bytes(marquee_url(rom), timeout_sec=10)
-        if b:
-            _st_image(b)
-            return
-    b2 = fetch_image_bytes(default_marquee_url(), timeout_sec=10)
-    if b2:
-        _st_image(b2)
 
-# ----------------------------
-# ADB (ArcadeItalia) on-demand integration
-# ----------------------------
-def adb_urls(rom: str):
-    rom = (rom or "").strip().lower()
-    page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
-    page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
+# -----------------------------
+# Chronicling America articles (v0.8)
+# -----------------------------
+CHRONAM_BASE = "https://chroniclingamerica.loc.gov/search/pages/results/"
 
-    params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
-    scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
-    scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
-    return {
-        "page_https": page_https,
-        "page_http": page_http,
-        "scraper_https": scraper_https,
-        "scraper_http": scraper_http,
-    }
-
-def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
-    req = Request(
+# ✅ PATCHED: safer JSON fetching with useful error messages
+def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
+    req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker; +https://streamlit.app)",
-            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8)",
+            "Accept": "application/json,text/javascript,*/*;q=0.1",
         },
-        method="GET",
     )
-    with urlopen(req, timeout=timeout_sec) as resp:
-        raw = resp.read()
-    text = raw.decode("utf-8", errors="replace").strip()
-    data = json.loads(text)
-    if isinstance(data, dict):
-        return data
-    return {"_data": data}
 
-def fetch_adb_details(rom: str) -> dict:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return {"_error": "No ROM short name available for this game."}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw_bytes = resp.read()
 
-    if rom in st.session_state.adb_cache:
-        return st.session_state.adb_cache[rom]
+        text = raw_bytes.decode("utf-8", errors="replace").strip()
 
-    urls = adb_urls(rom)
-    last_err = None
-    for u in (urls["scraper_https"], urls["scraper_http"]):
+        if not text:
+            raise RuntimeError(f"Chronicling America returned an empty response (HTTP {status}).")
+
+        if "json" not in ctype and not text.lstrip().startswith("{"):
+            preview = text[:220].replace("\n", " ").replace("\r", " ")
+            raise RuntimeError(
+                f"Chronicling America did not return JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). "
+                f"Preview: {preview}"
+            )
+
         try:
-            data = fetch_json_url(u, timeout_sec=12)
-            st.session_state.adb_cache[rom] = data
-            return data
-        except Exception as e:
-            last_err = str(e)
+            return json.loads(text)
+        except json.JSONDecodeError:
+            preview = text[:220].replace("\n", " ").replace("\r", " ")
+            raise RuntimeError(
+                f"Invalid JSON from Chronicling America (HTTP {status}, Content-Type: {ctype or 'unknown'}). "
+                f"Preview: {preview}"
+            )
 
-    out = {
-        "_error": "Could not retrieve data from ADB right now.",
-        "_detail": last_err or "Unknown error",
-        "_rom": rom,
-        "_fallback_page": urls["page_http"],
+    except Exception as e:
+        raise RuntimeError(f"Article fetch failed: {e}") from e
+
+
+@st.cache_data(show_spinner=False)
+def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
+    """
+    Searches Chronicling America pages for a year range (same year) and query terms.
+    Returns list of item dicts from the JSON response.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    rows = max(1, min(int(rows), 50))
+
+    params = {
+        "dateFilterType": "yearRange",
+        "date1": str(year),
+        "date2": str(year),
+        "rows": str(rows),
+        "searchType": "advanced",
+        "format": "json",
+        "andtext": query,
     }
-    st.session_state.adb_cache[rom] = out
-    return out
+    url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
+    data = _fetch_json(url)
 
-def extract_image_urls(obj) -> list[str]:
-    urls: list[str] = []
-    def walk(x):
-        if isinstance(x, dict):
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-        elif isinstance(x, str):
-            s = x.strip()
-            if s.startswith("http://") or s.startswith("https://"):
-                if re.search(r"\.(png|jpg|jpeg|webp)(\?.*)?$", s, re.IGNORECASE):
-                    urls.append(s)
-    walk(obj)
-    seen = set()
-    out: list[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    items = data.get("items")
+    if isinstance(items, list):
+        return items
 
-def show_adb_block(rom: str):
-    rom = (rom or "").strip().lower()
-    if not rom:
-        st.info("ADB details require a ROM short name; this entry has none.")
-        return None
+    results = data.get("results")
+    if isinstance(results, list):
+        return results
 
-    urls = adb_urls(rom)
+    return []
 
-    st.markdown("**ADB links:**")
-    st.write(f"- ADB page (HTTP): {urls['page_http']}")
-    st.write(f"- ADB page (HTTPS): {urls['page_https']}")
+
+def pick_default_queries(year: int) -> List[str]:
+    # 1903–1912: "Highlanders" often used
+    if year <= 1912:
+        return ["highlanders", "new york highlanders", "yankees"]
+    return ["yankees", "new york yankees", "baseball yankees"]
+
+
+def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
+    date = str(item.get("date") or item.get("issue_date") or "")
+    paper = str(item.get("newspaper") or item.get("title") or item.get("publisher") or "Newspaper")
+    headline = str(item.get("headline") or item.get("place_of_publication") or "Newspaper page")
+    url = str(item.get("url") or item.get("id") or "")
+    snippet = str(item.get("snip") or item.get("snippet") or item.get("ocr_eng") or "")
+
+    if len(snippet) > 380:
+        snippet = snippet[:380].rstrip() + "…"
+
+    return {"date": date, "paper": paper, "headline": headline, "url": url, "snippet": snippet}
+
+
+def display_articles_panel(year: int):
+    st.markdown("### Articles (1903–1922)")
+
+    if year < 1903 or year > 1922:
+        st.info(
+            "Articles are enabled for **1903–1922** right now. "
+            "(We’ll expand later once we pick the next archive source.)"
+        )
+        return
+
+    defaults = pick_default_queries(year)
+    preset = st.selectbox("Preset searches", defaults, index=0)
+
+    custom = st.text_input(
+        "Add/override search terms (optional)",
+        value="",
+        help="Tip: keep it short (e.g., 'highlanders' or 'babe ruth').",
+    )
+    query = custom.strip() if custom.strip() else preset
+
+    rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
+
+    with st.spinner("Searching newspaper pages…"):
+        try:
+            items = chronam_search(year, query=query, rows=rows)
+        except Exception as e:
+            st.error(f"Could not fetch articles: {e}")
+            return
+
+    if not items:
+        st.warning("No results found for that query. Try different terms.")
+        return
+
+    st.caption("Results are digitized newspaper *pages* with OCR snippets. Click through to view the scan.")
+
+    for it in items:
+        a = normalize_article_item(it)
+        date = a["date"] or "Unknown date"
+        paper = a["paper"] or "Newspaper"
+        url = a["url"]
+        snippet = a["snippet"] or ""
+
+        top_line = f"{date} • {paper}"
+        link = f"[Open page]({url})" if url else ""
+
+        st.markdown(
+            f"""
+            <div class="article-card">
+              <div class="article-title">{top_line}</div>
+              <div class="article-meta">{link}</div>
+              <div class="article-snippet">{snippet if snippet else "<i>No OCR snippet available.</i>"}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# -----------------------------
+# UI helpers
+# -----------------------------
+def ws_rings_count(df: pd.DataFrame) -> int:
+    if df.empty or "WSWin" not in df.columns:
+        return 0
+    return int((df["WSWin"] == "Y").sum())
+
+
+def season_pills(row: pd.Series) -> str:
+    pills = []
+    if row.get("WSWin") == "Y":
+        pills.append("<span class='pill'>🏆 WS Champs</span>")
+    if row.get("LgWin") == "Y":
+        pills.append("<span class='pill'>AL Champs</span>")
+    if row.get("DivWin") == "Y":
+        pills.append("<span class='pill'>Div Champs</span>")
+    if row.get("WCWin") == "Y":
+        pills.append("<span class='pill'>Wild Card</span>")
+    return "".join(pills)
+
+
+def safe_default_year(available_years_desc: List[int], requested: Optional[int]) -> int:
+    if not available_years_desc:
+        return 0
+    if requested is not None and requested in available_years_desc:
+        return requested
+    return available_years_desc[0]
+
+
+def render_season_card(row: pd.Series, flags: Optional[dict] = None):
+    year = int(row["yearID"])
+    era = era_for_year(year)
+    css = f"season-card season-era-{era['css']}"
+
+    record = str(row.get("record") or "—")
+    win_pct = row.get("win_pct")
+    win_pct_str = f"{float(win_pct):.3f}" if pd.notna(win_pct) else "—"
+    postseason = str(row.get("postseason") or "—")
+
+    read_mark = ""
+    fav_mark = ""
+    notes_hint = ""
+
+    if flags:
+        f = flags.get(year) or {}
+        if f.get("is_read"):
+            read_mark = " ✅ Read"
+        if f.get("is_favorite"):
+            fav_mark = " ⭐ Favorite"
+        if (f.get("notes") or "").strip():
+            notes_hint = " 📝 Notes"
+
+    pills = season_pills(row)
+
+    marker_text = (read_mark + fav_mark + notes_hint).strip()
+    marker_html = f"<span class='pill'>{marker_text}</span>" if marker_text else ""
+
+    st.markdown(
+        f"""
+        <div class="{css}">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+            <div>
+              <div style="font-size:1.2rem; font-weight:900;">{year} Yankees</div>
+              <div class="small-note">{era['label']}</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-weight:800;">{record}</div>
+              <div class="small-note">Win% {win_pct_str}</div>
+            </div>
+          </div>
+          <div style="margin-top:8px;">
+            <span class="pill">Postseason: {postseason}</span>
+            {pills}
+            {marker_html}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------
+# Main App
+# -----------------------------
+def main():
+    st.set_page_config(page_title="Yankees History Timeline", layout="wide")
+    inject_css()
+
+    st.title("Yankees History Timeline")
+    st.sidebar.caption(f"Version {__version__}")
+
+    # Load data
+    try:
+        df = load_data("Teams.csv")
+    except Exception as e:
+        st.error(f"Error loading Teams.csv from repo root: {e}")
+        st.stop()
+
+    yank = get_yankees(df)
+    if yank.empty:
+        st.error("No Yankees seasons found (teamID='NYA'). Check your Teams.csv.")
+        st.stop()
+
+    # Supabase sidebar
+    st.sidebar.header("Persistence (optional)")
+    sb = get_supabase()
+    use_sb = False
+    user_id = "default"
+    flags: dict[int, dict] = {}
+
+    if sb is None:
+        if SUPABASE_ENABLED:
+            st.sidebar.info("Supabase library is available, but SUPABASE_URL / SUPABASE_KEY not set in secrets.")
+        else:
+            st.sidebar.info("Supabase not installed in this environment (optional).")
+    else:
+        use_sb = st.sidebar.toggle("Enable Supabase saving", value=True)
+        user_id = st.sidebar.text_input("User ID", value="andrew", help="Simple identifier for your flags/notes.")
+        if use_sb:
+            flags = read_flags(sb, user_id=user_id)
+
+    st.sidebar.divider()
+
+    # Sidebar filters
+    years_all = yank["yearID"].dropna().astype(int).tolist()
+    years_all_desc = sorted(years_all, reverse=True)
+    min_year, max_year = min(years_all), max(years_all)
+
+    st.sidebar.header("Filters")
+    start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
+
+    # Decades
+    try:
+        years_for_decades = [int(y) for y in years_all if y is not None]
+    except Exception:
+        years_for_decades = []
+
+    decade_starts = sorted({(y // 10) * 10 for y in years_for_decades}) if years_for_decades else []
+
+    selected_decades = st.sidebar.multiselect(
+        "Decades (optional)",
+        options=decade_starts,
+        default=[],
+        format_func=lambda d: f"{d}s",
+        help="Pick one or more decades to narrow the timeline.",
+    )
+
+    only_ws = st.sidebar.toggle("World Series champs only", value=False)
+    only_favs = st.sidebar.toggle("Favorites only", value=False) if use_sb else False
+    only_read = st.sidebar.toggle("Read only", value=False) if use_sb else False
+
+    # Apply filters
+    filt = yank[yank["yearID"].astype(int) >= int(start_year)].copy()
+
+    if selected_decades:
+        filt["decade"] = (filt["yearID"].astype(int) // 10) * 10
+        filt = filt[filt["decade"].isin(selected_decades)].copy()
+
+    if only_ws and "WSWin" in filt.columns:
+        filt = filt[filt["WSWin"] == "Y"].copy()
+
+    if use_sb and (only_favs or only_read):
+        keep_years = set()
+        for y, r in flags.items():
+            if only_favs and r.get("is_favorite"):
+                keep_years.add(int(y))
+            if only_read and r.get("is_read"):
+                keep_years.add(int(y))
+        filt = filt[filt["yearID"].astype(int).isin(sorted(keep_years))].copy()
+
+    filt = filt.sort_values("yearID", ascending=False)
+    years_filt_desc = filt["yearID"].dropna().astype(int).tolist()
+
+    # Ring counters
+    total_rings = ws_rings_count(yank)
+    filtered_rings = ws_rings_count(filt)
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
+        kpi_card("Total WS Rings", str(total_rings), "All seasons in dataset")
     with c2:
-        refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
+        kpi_card("Rings in Filter", str(filtered_rings), "Matches current filters")
     with c3:
-        show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
+        st.markdown(
+            "<div class='kpi'><div class='kpi-label'>Filter Summary</div>"
+            f"<div class='kpi-sub'>Start year ≥ <b>{start_year}</b>"
+            + (f" • Decades: <b>{', '.join([str(d)+'s' for d in selected_decades])}</b>" if selected_decades else "")
+            + (" • WS only" if only_ws else "")
+            + (" • Favorites only" if only_favs else "")
+            + (" • Read only" if only_read else "")
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
 
-    if refresh_btn and rom in st.session_state.adb_cache:
-        del st.session_state.adb_cache[rom]
+    if filt.empty:
+        st.warning("No seasons match your current filters.")
+        st.stop()
 
-    if not load_btn and not refresh_btn:
-        if rom in st.session_state.adb_cache and not st.session_state.adb_cache[rom].get("_error"):
-            data = st.session_state.adb_cache[rom]
-        else:
-            return None
-    else:
-        with st.spinner("Fetching from ADB..."):
-            data = fetch_adb_details(rom)
+    # Selected year (safe)
+    if "selected_year" not in st.session_state:
+        st.session_state["selected_year"] = years_filt_desc[0]
 
-    if isinstance(data, dict) and data.get("_error"):
-        st.error(data["_error"])
-        if data.get("_detail"):
-            st.caption(f"Details: {data['_detail']}")
-        return data
+    st.session_state["selected_year"] = safe_default_year(
+        available_years_desc=years_filt_desc, requested=st.session_state.get("selected_year")
+    )
 
-    st.markdown("#### ADB Details (summary)")
-    for k in ("title","description","manufacturer","year","genre","players","buttons","controls","rotation","status"):
-        if k in data and data[k]:
-            val = data[k]
-            if isinstance(val, (dict, list)):
-                st.write(f"**{k}:**")
-                st.json(val)
-            else:
-                st.write(f"**{k}:** {val}")
+    # Layout: timeline + details
+    left, right = st.columns([1.15, 0.85], gap="large")
 
-    if show_images:
-        imgs = extract_image_urls(data)
-        if imgs:
-            st.markdown("#### Artwork / Images")
-            for u in imgs[:10]:
-                _st_image(u)
-        else:
-            st.caption("No direct image URLs found in the ADB response for this title.")
-    return data
+    with left:
+        st.subheader("Timeline")
 
-# ----------------------------
-# Details panel
-# ----------------------------
-def show_game_details(row: pd.Series, *, show_marquees: bool):
-    g = normalize_str(row.get("game", ""))
-    y = int(row.get("year", 0))
-    c = normalize_str(row.get("company", ""))
-    genre = normalize_str(row.get("genre", ""))
-    platform = normalize_str(row.get("platform", ""))
-    rom = normalize_str(row.get("rom", "")).lower()
+        last_era_key = None
+        for _, row in filt.iterrows():
+            year = int(row["yearID"])
+            era = era_for_year(year)
 
-    # Marquee at top (right panel)
-    show_marquee(rom, enabled=show_marquees)
+            if era["key"] != last_era_key:
+                render_era_header(era)
+                last_era_key = era["key"]
 
-    cur_status = status_for_rom(rom)
-
-    st.markdown(f"## {g}")
-    st.caption(CABINET_SUMMARY)
-    st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
-
-    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 1])
-    with b1:
-        if st.button("⏳ Want", use_container_width=True, key=f"st_want_{rom}"):
-            update_status(rom, STATUS_WANT); st.rerun()
-    with b2:
-        if st.button("✅ Played", use_container_width=True, key=f"st_played_{rom}"):
-            update_status(rom, STATUS_PLAYED); st.rerun()
-    with b3:
-        if st.button("🧩 No ROM", use_container_width=True, key=f"st_norom_{rom}"):
-            update_status(rom, STATUS_NO_ROM); st.rerun()
-    with b4:
-        if st.button("🚫 Can't play", use_container_width=True, key=f"st_np_{rom}"):
-            update_status(rom, STATUS_NOT_PLAYABLE); st.rerun()
-    with b5:
-        if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
-            update_status(rom, None); st.rerun()
-
-    st.divider()
-
-    with st.expander("📌 Quick facts", expanded=True):
-        st.write(f"**Year:** {y}")
-        if c: st.write(f"**Company:** {c}")
-        if genre: st.write(f"**Genre:** {genre}")
-        if platform: st.write(f"**Platform:** {platform}")
-        if rom: st.write(f"**ROM (MAME short name):** `{rom}`")
-
-    # ADB first
-    with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
-        show_adb_block(rom)
-
-    # Other links dropdown
-    with st.expander("🔗 Research links", expanded=False):
-        for name, url in build_links(g).items():
-            st.write(f"- {name}: {url}")
-
-# ----------------------------
-# Boot
-# ----------------------------
-init_state()
-init_sqlite_db()  # safe even if using Supabase
-load_status_cache_once()
-
-try:
-    df = load_games_no_cache()
-except FileNotFoundError:
-    st.error(f"Could not find `{CSV_PATH}` in the repo root. Upload it to GitHub and redeploy.")
-    st.stop()
-except Exception as e:
-    st.error("Failed to load CSV.")
-    st.code(str(e))
-    st.stop()
-
-# ----------------------------
-# Sidebar
-# ----------------------------
-st.sidebar.header("🎛️ Controls")
-st.sidebar.caption(APP_VERSION)
-
-strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
-
-st.sidebar.subheader("Status filters")
-hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
-only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
-
-show_no_rom = st.sidebar.toggle("Include 🧩 Don't have ROM", value=False)
-show_not_playable = st.sidebar.toggle("Include 🚫 Not playable", value=False)
-
-st.sidebar.divider()
-show_marquees = st.sidebar.toggle("Show marquees", value=True)
-
-st.sidebar.divider()
-want_count = sum(1 for s in st.session_state.status_cache.values() if s == STATUS_WANT)
-st.sidebar.download_button(
-    label=f"📤 Export Want to Play ({want_count})",
-    data=build_want_to_play_txt(df),
-    file_name="arcade_want_to_play.txt",
-    mime="text/plain",
-    use_container_width=True,
-)
-
-st.sidebar.divider()
-search_name = st.sidebar.text_input("Search (name or ROM)", "")
-
-with st.sidebar.expander("Advanced filters", expanded=False):
-    years = st.slider("Year range", 1978, 2008, (1978, 2008))
-    platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
-    genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
-    platform_choice = st.multiselect("Platform (optional)", platforms)
-    genre_choice = st.multiselect("Genre (optional)", genres)
-
-# ----------------------------
-# Filtering
-# ----------------------------
-base = df[(df["year"] >= years[0]) & (df["year"] <= years[1])].copy()
-
-if platform_choice:
-    base = base[base["platform"].isin(platform_choice)]
-if genre_choice:
-    base = base[base["genre"].isin(genre_choice)]
-
-if strict_mode:
-    base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
-
-def keep_by_status(row: pd.Series) -> bool:
-    rom = normalize_str(row.get("rom", "")).lower()
-    s = status_for_rom(rom)
-
-    if only_want:
-        return s == STATUS_WANT
-
-    if hide_played and s == STATUS_PLAYED:
-        return False
-
-    if (not show_no_rom) and s == STATUS_NO_ROM:
-        return False
-
-    if (not show_not_playable) and s == STATUS_NOT_PLAYABLE:
-        return False
-
-    return True
-
-base = base[base.apply(keep_by_status, axis=1)].copy()
-base = base.sort_values(["year", "game"]).reset_index(drop=True)
-
-if search_name.strip():
-    s = search_name.strip().lower()
-    hits = base[
-        base["_game_l"].str.contains(s, na=False)
-        | base["rom"].astype(str).str.lower().str.contains(s, na=False)
-    ].copy()
-else:
-    hits = base.copy()
-
-# ----------------------------
-# Two-panel layout
-# ----------------------------
-left, right = st.columns([1.15, 1.0], gap="large")
-
-with left:
-    st.subheader("🎲 Discover")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        pick_random = st.button("🎲 Random", use_container_width=True)
-    with c2:
-        clear_sel = st.button("🧹 Clear selection", use_container_width=True)
-
-    if clear_sel:
-        st.session_state.picked_rows = []
-        st.session_state.selected_key = None
-        st.rerun()
-
-    st.markdown("#### 📆 Game of the Day")
-    now = datetime.now(TZ)
-    seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-
-    if len(hits) > 0:
-        gotd = hits.iloc[seed % len(hits)]
-        st.caption(f"Today: **{gotd['game']}** ({gotd['year']})")
-        if st.button("Open Game of the Day", use_container_width=True):
-            st.session_state.selected_key = game_key(gotd)
-            st.rerun()
-    else:
-        st.caption("No Game of the Day with current filters.")
-
-    if pick_random:
-        if len(hits) == 0:
-            st.warning("No games match your current cabinet + status filters. Widen filters.")
-        else:
-            row = hits.sample(1).iloc[0]
-            st.session_state.selected_key = game_key(row)
-            st.rerun()
-
-    st.divider()
-
-    with st.expander("More ways to discover", expanded=True):
-        st.caption(f"Matches: **{len(hits):,}**")
-
-        c3, c4 = st.columns([1, 1])
-        with c3:
-            pick_10 = st.button("🎯 10 Picks", use_container_width=True)
-        with c4:
-            clear_picks = st.button("🧽 Clear 10 Picks", use_container_width=True)
-
-        if clear_picks:
-            st.session_state.picked_rows = []
-            st.rerun()
-
-        if pick_10:
-            if len(hits) == 0:
-                st.warning("No games match your current filters. Widen filters.")
-            else:
-                n = min(10, len(hits))
-                sample = hits.sample(n).copy()
-                st.session_state.picked_rows = sample.to_dict("records")
-                st.session_state.selected_key = game_key(pd.Series(st.session_state.picked_rows[0]))
-                st.rerun()
-
-        st.markdown("##### 📜 Browse list")
-        view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
-        view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
-        st.dataframe(view, use_container_width=True, height=360)
-
-        st.markdown("##### Select a game")
-        if len(view) == 0:
-            st.info("No results to select. Adjust filters.")
-        else:
-            labels = (
-                view["game"].astype(str)
-                + " — "
-                + view["year"].astype(str)
-                + " — "
-                + view["company"].astype(str)
-                + " — "
-                + view["status"].astype(str)
-            )
-            selected_label = st.selectbox("Pick from results", labels, key="browse_select")
-            idx = labels[labels == selected_label].index[0]
-            selected_row = view.loc[idx]
-
-            if st.button("➡️ Open selected", use_container_width=True):
-                st.session_state.selected_key = game_key(selected_row)
-                st.rerun()
-
-        if st.session_state.picked_rows:
-            st.markdown("##### 🎯 Your 10 picks")
-            pick_df = pd.DataFrame(st.session_state.picked_rows)
-            pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
-            pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
-
-            for i, r in pick_df.iterrows():
-                label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
-                if st.button(label, key=f"pick_{i}", use_container_width=True):
-                    st.session_state.selected_key = game_key(r)
+            cols = st.columns([0.82, 0.18])
+            with cols[0]:
+                render_season_card(row, flags=flags if use_sb else None)
+            with cols[1]:
+                if st.button("View", key=f"view_{year}"):
+                    st.session_state["selected_year"] = year
                     st.rerun()
 
-with right:
-    st.subheader("🧾 Details")
-    if not st.session_state.selected_key:
-        st.info("Pick a game from the left (Random / Game of the Day / Browse) to see details.")
-    else:
-        key = st.session_state.selected_key
+    with right:
+        st.subheader("Season Details")
 
-        if key.startswith("rom:"):
-            rom = key.split("rom:", 1)[1]
-            match = df[df["rom"] == rom]
-            if len(match) == 0:
-                st.warning("Selected game not found in dataset.")
-            else:
-                show_game_details(match.iloc[0], show_marquees=show_marquees)
-        else:
-            try:
-                _, meta = key.split("meta:", 1)
-                title, year_str, company = meta.split("|", 2)
-                year = int(year_str)
-                match = df[(df["game"] == title) & (df["year"] == year) & (df["company"] == company)]
-                if len(match) == 0:
-                    st.warning("Selected game not found in dataset.")
-                else:
-                    show_game_details(match.iloc[0], show_marquees=show_marquees)
-            except Exception:
-                st.warning("Could not resolve selection key.")
+        sel = st.selectbox(
+            "Jump to season",
+            options=years_filt_desc,
+            index=0,
+            format_func=lambda y: str(y),
+            key="jump_selectbox",
+        )
+        if sel != st.session_state["selected_year"]:
+            st.session_state["selected_year"] = int(sel)
+
+        sel_year = int(st.session_state["selected_year"])
+        row_df = yank[yank["yearID"].astype(int) == sel_year]
+        if row_df.empty:
+            st.error("Selected season not found in dataset.")
+            st.stop()
+        row = row_df.iloc[0]
+
+        render_season_card(row, flags=flags if use_sb else None)
+
+        # Flag controls
+        if use_sb:
+            f = flags.get(sel_year) or {}
+            st.markdown("#### Your Flags")
+
+            colA, colB = st.columns(2)
+            with colA:
+                is_read = st.checkbox("Mark as read", value=bool(f.get("is_read")), key=f"read_{sel_year}")
+            with colB:
+                is_fav = st.checkbox("Favorite", value=bool(f.get("is_favorite")), key=f"fav_{sel_year}")
+
+            notes = st.text_area(
+                "Notes",
+                value=str(f.get("notes") or ""),
+                height=110,
+                key=f"notes_{sel_year}",
+                placeholder="What stood out? Players, stories, memories…",
+            )
+
+            if st.button("Save", key=f"save_{sel_year}"):
+                try:
+                    save_flag(sb, user_id=user_id, year=sel_year, read=is_read, fav=is_fav, notes=notes)
+                    st.success("Saved.")
+                    flags = read_flags(sb, user_id=user_id)
+                except Exception as e:
+                    st.error(f"Could not save: {e}")
+
+        st.markdown("#### Season Snapshot")
+        snap = {
+            "Year": sel_year,
+            "Record": row.get("record", "—"),
+            "Win %": f"{float(row['win_pct']):.3f}" if pd.notna(row.get("win_pct")) else "—",
+            "Postseason": row.get("postseason", "—"),
+            "WSWin": row.get("WSWin", ""),
+            "LgWin": row.get("LgWin", ""),
+            "DivWin": row.get("DivWin", ""),
+            "WCWin": row.get("WCWin", ""),
+        }
+        st.write(snap)
+
+        st.divider()
+        display_articles_panel(sel_year)
+
+
+if __name__ == "__main__":
+    main()
