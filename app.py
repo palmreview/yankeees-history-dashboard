@@ -1,5 +1,5 @@
 # Yankees History Timeline Dashboard
-# Version: 0.8.2 (loc.gov search ops + better presets; preserves all existing functionality)
+# Version: 0.8.3 (Better newspaper search: proximity ops + shorter presets; preserves all existing functionality)
 # Date: 2026-02-10
 #
 # Preserved:
@@ -12,21 +12,21 @@
 # - Safe selection (never crashes on small filtered sets)
 # - Articles panel via loc.gov Chronicling America collection (clickable links)
 #
-# Updated (v0.8.2):
-# - loc.gov search now uses explicit `ops` (AND / PHRASE / OR) instead of relying on quotes
-# - Preset queries no longer use quotes (OCR tolerant)
-# - Optional "Prefer New York papers" facet to reduce noise without killing results
-# - Keeps strict filter (team term required) and sorts by baseball-likeness
+# Updated (v0.8.3):
+# - Default search mode is proximity (~10) for noisy OCR
+# - Presets are shorter / more OCR-tolerant (e.g., "yankees base ball")
+# - Strict filtering is optional and won’t zero results silently
+# - Debug expander shows request URL + total results returned by API
 
 import json
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 # -----------------------------
 # Optional Supabase
@@ -34,7 +34,6 @@ __version__ = "0.8.2"
 SUPABASE_ENABLED = False
 try:
     from supabase import create_client  # type: ignore
-
     SUPABASE_ENABLED = True
 except Exception:
     SUPABASE_ENABLED = False
@@ -317,26 +316,34 @@ BASEBALL_TERMS = [
     "rbi",
 ]
 
-TEAM_TERMS_PRE1913 = ["highlanders", "new york highlanders"]
-TEAM_TERMS_POST1912 = ["yankees", "new york yankees"]
+TEAM_TERMS_PRE1913 = [
+    "highlanders",
+    "new york highlanders",
+    # occasional shorthand / OCR weirdness:
+    "n.y. highlanders",
+]
+TEAM_TERMS_POST1912 = [
+    "yankees",
+    "new york yankees",
+    "n.y. yankees",
+]
 
 
 def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8.2)",
+            "User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8.3)",
             "Accept": "application/json,text/javascript,*/*;q=0.1",
         },
     )
-
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             ctype = (resp.headers.get("Content-Type") or "").lower()
-            raw_bytes = resp.read()
+            raw = resp.read()
 
-        text = raw_bytes.decode("utf-8", errors="replace").strip()
+        text = raw.decode("utf-8", errors="replace").strip()
         if not text:
             raise RuntimeError(f"Empty response (HTTP {status}).")
 
@@ -346,14 +353,7 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
                 f"Did not return JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). Preview: {preview}"
             )
 
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            preview = text[:220].replace("\n", " ").replace("\r", " ")
-            raise RuntimeError(
-                f"Invalid JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). Preview: {preview}"
-            )
-
+        return json.loads(text)
     except Exception as e:
         raise RuntimeError(f"Article fetch failed: {e}") from e
 
@@ -363,20 +363,21 @@ def chronam_search_locgov(
     year: int,
     query: str,
     rows: int = 20,
-    ops: str = "AND",
+    ops: str = "~10",
     state: str | None = None,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    loc.gov Chronicling America collection search.
-    Uses explicit `ops` (AND/PHRASE/OR) instead of relying on quotes.
-    Optional state facet reduces noise without requiring baseball words in the snippet.
+    Returns a dict with:
+      - results: list
+      - total: int (if available)
+      - request_url: str
     """
     query = (query or "").strip()
     if not query:
-        return []
+        return {"results": [], "total": 0, "request_url": ""}
 
     rows = max(1, min(int(rows), 50))
-    ops = (ops or "AND").strip().upper()
+    ops = (ops or "~10").strip().upper()
 
     params = {
         "fo": "json",
@@ -387,31 +388,38 @@ def chronam_search_locgov(
         "end_date": f"{year}-12-31",
         "dl": "page",
     }
-
     if state:
         params["location_state"] = state
 
-    url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
-    data = _fetch_json(url)
+    request_url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
+    data = _fetch_json(request_url)
 
-    results = data.get("results")
-    return results if isinstance(results, list) else []
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    total = 0
+    pag = data.get("pagination")
+    if isinstance(pag, dict):
+        try:
+            total = int(pag.get("total") or 0)
+        except Exception:
+            total = 0
+
+    return {"results": results, "total": total, "request_url": request_url}
 
 
-# ✅ Updated presets: no quotes (OCR tolerant) + period-accurate "base ball"
 def pick_default_queries(year: int) -> List[str]:
+    # Short + tolerant = more hits, then we sort by baseball-likeness
     if year <= 1912:
         return [
+            "highlanders base ball",
+            "highlanders box score",
+            "highlanders american league",
             "new york highlanders base ball",
-            "highlanders american league base ball",
-            "new york highlanders box score",
-            "highlanders pitcher base ball",
         ]
     return [
+        "yankees base ball",
+        "yankees box score",
+        "yankees american league",
         "new york yankees base ball",
-        "yankees american league base ball",
-        "new york yankees box score",
-        "yankees pitcher base ball",
     ]
 
 
@@ -442,27 +450,28 @@ def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
     if len(snippet) > 420:
         snippet = snippet[:420].rstrip() + "…"
 
-    return {"date": date, "paper": title, "headline": title, "url": url, "snippet": snippet}
+    return {"date": date, "paper": title, "url": url, "snippet": snippet}
 
 
-def _text_blob_for_relevance(item: Dict[str, Any]) -> str:
+def _text_blob_for_scoring(item: Dict[str, Any]) -> str:
+    # Keep scoring broad, not just snippet
     parts = [
-        str(item.get("title") or ""),
         str(item.get("snippet") or ""),
         str(item.get("description") or ""),
+        str(item.get("title") or ""),
     ]
     return " ".join(parts).lower()
 
 
-def is_team_relevant(item: Dict[str, Any], year: int) -> bool:
-    blob = _text_blob_for_relevance(item)
-    team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
-    return any(t in blob for t in team_terms)
-
-
 def baseball_score(item: Dict[str, Any]) -> int:
-    blob = _text_blob_for_relevance(item)
+    blob = _text_blob_for_scoring(item)
     return sum(1 for t in BASEBALL_TERMS if t in blob)
+
+
+def team_score(item: Dict[str, Any], year: int) -> int:
+    blob = _text_blob_for_scoring(item)
+    team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
+    return sum(1 for t in team_terms if t in blob)
 
 
 def display_articles_panel(year: int):
@@ -478,7 +487,7 @@ def display_articles_panel(year: int):
     custom = st.text_input(
         "Add/override search terms (optional)",
         value="",
-        help='Try: "box score", "American League", pitcher names. Early papers often use "base ball" (two words).',
+        help='Tip: keep it short. Great add-ons: "box score", "american league", "base ball".',
     )
     query = custom.strip() if custom.strip() else preset
 
@@ -486,33 +495,66 @@ def display_articles_panel(year: int):
     with colA:
         rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
     with colB:
-        ops = st.selectbox("Search mode", ["AND", "PHRASE", "OR"], index=0, help="AND = all words; PHRASE = exact phrase; OR = any word.")
+        ops = st.selectbox(
+            "Search mode",
+            ["~10", "~5", "AND", "PHRASE", "OR"],
+            index=0,
+            help="~10/~5 = words near each other (best for OCR); AND = all words; PHRASE = exact; OR = any word.",
+        )
     with colC:
-        ny_only = st.checkbox("Prefer New York papers", value=False, help="Facet filter that reduces off-topic results.")
+        ny_only = st.checkbox("Prefer New York papers", value=False, help="Facet filter that reduces noise.")
 
-    strict = st.checkbox("Require team mention (recommended)", value=True)
+    # Important change: strict filter is optional and defaults OFF
+    strict_filter = st.checkbox(
+        "Strict filter: require snippet mentions team name (may hide good results)",
+        value=False,
+    )
 
     state = "new york" if ny_only else None
 
     with st.spinner("Searching newspaper pages…"):
         try:
-            items = chronam_search_locgov(year, query=query, rows=rows, ops=ops, state=state)
+            payload = chronam_search_locgov(year, query=query, rows=rows, ops=ops, state=state)
         except Exception as e:
             st.error(f"Could not fetch articles: {e}")
             return
 
-    if strict:
-        items = [it for it in items if is_team_relevant(it, year)]
-        items.sort(key=baseball_score, reverse=True)
+    items = payload.get("results") or []
+    total = int(payload.get("total") or 0)
+    request_url = payload.get("request_url") or ""
+
+    with st.expander("Debug: request + counts", expanded=False):
+        st.write({"total_results_estimate": total, "returned": len(items)})
+        if request_url:
+            st.code(request_url)
 
     if not items:
         st.warning(
-            "No results found with these settings. "
-            "Try switching Search mode to OR, removing 'base ball', disabling 'Prefer New York', or disabling strict."
+            "No results from the API for that query. Try:\n"
+            "- switching Search mode to OR\n"
+            "- removing words (keep 2–3 words)\n"
+            "- using 'yankees box score' or 'highlanders box score'\n"
+            "- turning off 'Prefer New York papers'\n"
         )
         return
 
-    st.caption("These are digitized newspaper pages with OCR snippets. Click to open on Library of Congress.")
+    # Sort best-first: team hits first, then baseball-likeness
+    items.sort(key=lambda it: (team_score(it, year), baseball_score(it)), reverse=True)
+
+    if strict_filter:
+        # Only filter if it won't wipe out the list
+        team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
+        def has_team_in_snippet(it: Dict[str, Any]) -> bool:
+            sn = (str(it.get("snippet") or "") + " " + str(it.get("description") or "")).lower()
+            return any(t in sn for t in team_terms)
+
+        filtered = [it for it in items if has_team_in_snippet(it)]
+        if filtered:
+            items = filtered
+        else:
+            st.info("Strict filter would remove everything (snippets are short). Showing best-ranked results instead.")
+
+    st.caption("Digitized newspaper pages with OCR snippets. Click to open on Library of Congress.")
 
     for it in items:
         a = normalize_article_item(it)
@@ -670,13 +712,7 @@ def main():
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
-    # Decades (safe)
-    try:
-        years_for_decades = [int(y) for y in years_all if y is not None]
-    except Exception:
-        years_for_decades = []
-
-    decade_starts = sorted({(y // 10) * 10 for y in years_for_decades}) if years_for_decades else []
+    decade_starts = sorted({(int(y) // 10) * 10 for y in years_all}) if years_all else []
     selected_decades = st.sidebar.multiselect(
         "Decades (optional)",
         options=decade_starts,
@@ -749,7 +785,6 @@ def main():
 
     with left:
         st.subheader("Timeline")
-
         last_era_key = None
         for _, row in filt.iterrows():
             year = int(row["yearID"])
@@ -789,6 +824,7 @@ def main():
 
         render_season_card(row, flags=flags if use_sb else None)
 
+        # Flag controls
         if use_sb:
             f = flags.get(sel_year) or {}
             st.markdown("#### Your Flags")
