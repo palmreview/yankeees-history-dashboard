@@ -9,7 +9,7 @@
 # - Optional Supabase persistence (read/favorite/notes) via user_season_flags
 # - Ring Counter (overall + in current filter)
 # - Dynasty/Era bands in timeline
-# - Safe slider (never crashes on small filtered sets)
+# - Safe selection (never crashes on small filtered sets)
 #
 # Added (v0.8):
 # - "Articles" panel that auto-fetches historical newspaper pages for seasons 1903–1922
@@ -32,6 +32,7 @@ __version__ = "0.8"
 SUPABASE_ENABLED = False
 try:
     from supabase import create_client  # type: ignore
+
     SUPABASE_ENABLED = True
 except Exception:
     SUPABASE_ENABLED = False
@@ -119,6 +120,8 @@ def inject_css():
         .article-title { font-weight: 800; }
         .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 2px; }
         .article-snippet { margin-top: 8px; color: rgba(17,24,39,0.85); }
+
+        .small-note { color: rgba(17,24,39,0.65); font-size: 0.9rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -143,15 +146,16 @@ def kpi_card(label: str, value: str, sub: str | None = None):
 # Era Bands
 # -----------------------------
 ERAS = [
-    ("pre",  "Early Years (Highlanders / pre-Ruth)", 1903, 1919, "pre"),
-    ("ruth", "Ruth & Gehrig Era",                    1920, 1934, "ruth"),
-    ("dim",  "DiMaggio Era",                         1936, 1951, "dim"),
-    ("mant", "Mantle / 50s–60s Dynasty",             1952, 1964, "mant"),
-    ("zoo",  "Bronx Zoo / Late-70s Rise",            1976, 1981, "zoo"),
-    ("lean", "Lean Years / Mattingly Era",           1982, 1995, "lean"),
-    ("core", "Core Four Era",                        1996, 2009, "core"),
-    ("mod",  "Modern Era",                           2010, 2026, "mod"),
+    ("pre", "Early Years (Highlanders / pre-Ruth)", 1903, 1919, "pre"),
+    ("ruth", "Ruth & Gehrig Era", 1920, 1934, "ruth"),
+    ("dim", "DiMaggio Era", 1936, 1951, "dim"),
+    ("mant", "Mantle / 50s–60s Dynasty", 1952, 1964, "mant"),
+    ("zoo", "Bronx Zoo / Late-70s Rise", 1976, 1981, "zoo"),
+    ("lean", "Lean Years / Mattingly Era", 1982, 1995, "lean"),
+    ("core", "Core Four Era", 1996, 2009, "core"),
+    ("mod", "Modern Era", 2010, 2026, "mod"),
 ]
+
 
 def era_for_year(year: int) -> dict:
     for key, label, start, end, css in ERAS:
@@ -285,6 +289,7 @@ def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
 # -----------------------------
 CHRONAM_BASE = "https://chroniclingamerica.loc.gov/search/pages/results/"
 
+
 def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
@@ -299,8 +304,7 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
 def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
     """
     Searches Chronicling America pages for a year range (same year) and query terms.
-    Returns list of item dicts.
-    API style is the /search/pages/results endpoint with format=json. :contentReference[oaicite:1]{index=1}
+    Returns list of item dicts from the JSON response.
     """
     params = {
         "dateFilterType": "yearRange",
@@ -309,70 +313,50 @@ def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]
         "rows": str(rows),
         "searchType": "advanced",
         "format": "json",
-        # Use 'andtext' for AND terms (space-separated becomes +)
         "andtext": query,
     }
     url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
     data = _fetch_json(url)
-    # Chronicling America search returns 'items' array (older style), but keep defensive.
+
     items = data.get("items")
     if isinstance(items, list):
         return items
-    # Sometimes 'results' may appear in other structures; fallback
+
     results = data.get("results")
     if isinstance(results, list):
         return results
+
     return []
 
 
 def pick_default_queries(year: int) -> List[str]:
-    """
-    Keep it simple: 2–3 preset searches per year.
-    1903–1912: Highlanders era name frequently used.
-    """
+    # 1903–1912: "Highlanders" often used
     if year <= 1912:
-        return [
-            "highlanders",
-            "new york highlanders",
-            "yankees",
-        ]
-    return [
-        "yankees",
-        "new york yankees",
-        "baseball yankees",
-    ]
+        return ["highlanders", "new york highlanders", "yankees"]
+    return ["yankees", "new york yankees", "baseball yankees"]
 
 
 def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Normalizes a CA item to consistent fields for display.
-    Typical fields in CA items include: title, date, edition, sequence, url, id, snip.
-    """
     date = str(item.get("date") or item.get("issue_date") or "")
     paper = str(item.get("newspaper") or item.get("title") or item.get("publisher") or "Newspaper")
-    # 'title' in CA items is sometimes paper title, so also check 'headline' or 'ocr_eng' isn't a title.
     headline = str(item.get("headline") or item.get("place_of_publication") or "Newspaper page")
     url = str(item.get("url") or item.get("id") or "")
     snippet = str(item.get("snip") or item.get("snippet") or item.get("ocr_eng") or "")
 
-    # Keep snippet short for UI
     if len(snippet) > 380:
         snippet = snippet[:380].rstrip() + "…"
 
-    return {
-        "date": date,
-        "paper": paper,
-        "headline": headline,
-        "url": url,
-        "snippet": snippet,
-    }
+    return {"date": date, "paper": paper, "headline": headline, "url": url, "snippet": snippet}
 
 
 def display_articles_panel(year: int):
     st.markdown("### Articles (1903–1922)")
 
     if year < 1903 or year > 1922:
-        st.info("Articles are enabled for **1903–1922** right now. (We’ll expand later once we pick the next archive source.)")
+        st.info(
+            "Articles are enabled for **1903–1922** right now. "
+            "(We’ll expand later once we pick the next archive source.)"
+        )
         return
 
     defaults = pick_default_queries(year)
@@ -407,7 +391,6 @@ def display_articles_panel(year: int):
         url = a["url"]
         snippet = a["snippet"] or ""
 
-        # Build a nicer label: some CA items use 'title' as newspaper title; treat as paper name.
         top_line = f"{date} • {paper}"
         link = f"[Open page]({url})" if url else ""
 
@@ -421,6 +404,86 @@ def display_articles_panel(year: int):
             """,
             unsafe_allow_html=True,
         )
+
+
+# -----------------------------
+# UI helpers
+# -----------------------------
+def ws_rings_count(df: pd.DataFrame) -> int:
+    if df.empty or "WSWin" not in df.columns:
+        return 0
+    return int((df["WSWin"] == "Y").sum())
+
+
+def season_pills(row: pd.Series) -> str:
+    pills = []
+    if row.get("WSWin") == "Y":
+        pills.append("<span class='pill'>🏆 WS Champs</span>")
+    if row.get("LgWin") == "Y":
+        pills.append("<span class='pill'>AL Champs</span>")
+    if row.get("DivWin") == "Y":
+        pills.append("<span class='pill'>Div Champs</span>")
+    if row.get("WCWin") == "Y":
+        pills.append("<span class='pill'>Wild Card</span>")
+    return "".join(pills)
+
+
+def safe_default_year(available_years_desc: List[int], requested: Optional[int]) -> int:
+    # available_years_desc: list sorted DESC
+    if not available_years_desc:
+        return 0
+    if requested is not None and requested in available_years_desc:
+        return requested
+    return available_years_desc[0]
+
+
+def render_season_card(row: pd.Series, flags: Optional[dict] = None):
+    year = int(row["yearID"])
+    era = era_for_year(year)
+    css = f"season-card season-era-{era['css']}"
+
+    record = str(row.get("record") or "—")
+    win_pct = row.get("win_pct")
+    win_pct_str = f"{float(win_pct):.3f}" if pd.notna(win_pct) else "—"
+    postseason = str(row.get("postseason") or "—")
+
+    read_mark = ""
+    fav_mark = ""
+    notes_hint = ""
+
+    if flags:
+        f = flags.get(year) or {}
+        if f.get("is_read"):
+            read_mark = " ✅ Read"
+        if f.get("is_favorite"):
+            fav_mark = " ⭐ Favorite"
+        if (f.get("notes") or "").strip():
+            notes_hint = " 📝 Notes"
+
+    pills = season_pills(row)
+
+    st.markdown(
+        f"""
+        <div class="{css}">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+            <div>
+              <div style="font-size:1.2rem; font-weight:900;">{year} Yankees</div>
+              <div class="small-note">{era['label']}</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-weight:800;">{record}</div>
+              <div class="small-note">Win% {win_pct_str}</div>
+            </div>
+          </div>
+          <div style="margin-top:8px;">
+            <span class="pill">Postseason: {postseason}</span>
+            {pills}
+            {"<span class='pill'>" + (read_mark + fav_mark + notes_hint).strip() + "</span>" if (read_mark or fav_mark or notes_hint) else ""}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------
@@ -445,11 +508,208 @@ def main():
         st.error("No Yankees seasons found (teamID='NYA'). Check your Teams.csv.")
         st.stop()
 
+    # Supabase sidebar
+    st.sidebar.header("Persistence (optional)")
+    sb = get_supabase()
+    use_sb = False
+    user_id = "default"
+    flags: dict[int, dict] = {}
+
+    if sb is None:
+        if SUPABASE_ENABLED:
+            st.sidebar.info("Supabase library is available, but SUPABASE_URL / SUPABASE_KEY not set in secrets.")
+        else:
+            st.sidebar.info("Supabase not installed in this environment (optional).")
+    else:
+        use_sb = st.sidebar.toggle("Enable Supabase saving", value=True)
+        user_id = st.sidebar.text_input("User ID", value="andrew", help="Simple identifier for your flags/notes.")
+        if use_sb:
+            flags = read_flags(sb, user_id=user_id)
+
+    st.sidebar.divider()
+
     # Sidebar filters
     years_all = yank["yearID"].dropna().astype(int).tolist()
+    years_all_desc = sorted(years_all, reverse=True)
     min_year, max_year = min(years_all), max(years_all)
 
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
-    decade_starts = sorted({(y // 10) * 10 for y in years*_
+    # ✅ FIXED decade_starts (no truncation)
+    try:
+        years_for_decades = [int(y) for y in years_all if y is not None]
+    except Exception:
+        years_for_decades = []
+
+    if years_for_decades:
+        decade_starts = sorted({(y // 10) * 10 for y in years_for_decades})
+    else:
+        decade_starts = []
+
+    decade_labels = [f"{d}s" for d in decade_starts]
+    selected_decades = st.sidebar.multiselect(
+        "Decades (optional)",
+        options=decade_starts,
+        default=[],
+        format_func=lambda d: f"{d}s",
+        help="Pick one or more decades to narrow the timeline.",
+    )
+
+    only_ws = st.sidebar.toggle("World Series champs only", value=False)
+    only_favs = st.sidebar.toggle("Favorites only", value=False) if use_sb else False
+    only_read = st.sidebar.toggle("Read only", value=False) if use_sb else False
+
+    # Apply filters
+    filt = yank[yank["yearID"].astype(int) >= int(start_year)].copy()
+
+    if selected_decades:
+        filt["decade"] = (filt["yearID"].astype(int) // 10) * 10
+        filt = filt[filt["decade"].isin(selected_decades)].copy()
+
+    if only_ws and "WSWin" in filt.columns:
+        filt = filt[filt["WSWin"] == "Y"].copy()
+
+    if use_sb and (only_favs or only_read):
+        # Keep only years matching flags
+        keep_years = set()
+        for y, r in flags.items():
+            if only_favs and r.get("is_favorite"):
+                keep_years.add(int(y))
+            if only_read and r.get("is_read"):
+                keep_years.add(int(y))
+        filt = filt[filt["yearID"].astype(int).isin(sorted(keep_years))].copy()
+
+    filt = filt.sort_values("yearID", ascending=False)
+    years_filt_desc = filt["yearID"].dropna().astype(int).tolist()
+
+    # Ring counters
+    total_rings = ws_rings_count(yank)
+    filtered_rings = ws_rings_count(filt)
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        kpi_card("Total WS Rings", str(total_rings), "All seasons in dataset")
+    with c2:
+        kpi_card("Rings in Filter", str(filtered_rings), "Matches current filters")
+    with c3:
+        st.markdown(
+            "<div class='kpi'><div class='kpi-label'>Filter Summary</div>"
+            f"<div class='kpi-sub'>Start year ≥ <b>{start_year}</b>"
+            + (f" • Decades: <b>{', '.join([str(d)+'s' for d in selected_decades])}</b>" if selected_decades else "")
+            + (" • WS only" if only_ws else "")
+            + (" • Favorites only" if only_favs else "")
+            + (" • Read only" if only_read else "")
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    if filt.empty:
+        st.warning("No seasons match your current filters.")
+        st.stop()
+
+    # Selected year (safe)
+    if "selected_year" not in st.session_state:
+        st.session_state["selected_year"] = years_filt_desc[0]
+
+    st.session_state["selected_year"] = safe_default_year(
+        available_years_desc=years_filt_desc, requested=st.session_state.get("selected_year")
+    )
+
+    # Layout: timeline + details
+    left, right = st.columns([1.15, 0.85], gap="large")
+
+    with left:
+        st.subheader("Timeline")
+
+        # Group by era bands
+        # We'll render eras top-to-bottom (oldest to newest) or newest to oldest?
+        # This timeline is seasons-first and your data is desc; keep descending but show era headers when it changes.
+        last_era_key = None
+        for _, row in filt.iterrows():
+            year = int(row["yearID"])
+            era = era_for_year(year)
+
+            if era["key"] != last_era_key:
+                render_era_header(era)
+                last_era_key = era["key"]
+
+            # Card + select button
+            cols = st.columns([0.82, 0.18])
+            with cols[0]:
+                render_season_card(row, flags=flags if use_sb else None)
+            with cols[1]:
+                if st.button("View", key=f"view_{year}"):
+                    st.session_state["selected_year"] = year
+                    st.rerun()
+
+    with right:
+        st.subheader("Season Details")
+
+        # Quick jump selector (safe on small sets)
+        sel = st.selectbox(
+            "Jump to season",
+            options=years_filt_desc,
+            index=0,
+            format_func=lambda y: str(y),
+            key="jump_selectbox",
+        )
+        if sel != st.session_state["selected_year"]:
+            st.session_state["selected_year"] = int(sel)
+
+        sel_year = int(st.session_state["selected_year"])
+        row_df = yank[yank["yearID"].astype(int) == sel_year]
+        if row_df.empty:
+            st.error("Selected season not found in dataset.")
+            st.stop()
+        row = row_df.iloc[0]
+
+        render_season_card(row, flags=flags if use_sb else None)
+
+        # Flag controls
+        if use_sb:
+            f = flags.get(sel_year) or {}
+            st.markdown("#### Your Flags")
+
+            colA, colB = st.columns(2)
+            with colA:
+                is_read = st.checkbox("Mark as read", value=bool(f.get("is_read")), key=f"read_{sel_year}")
+            with colB:
+                is_fav = st.checkbox("Favorite", value=bool(f.get("is_favorite")), key=f"fav_{sel_year}")
+
+            notes = st.text_area(
+                "Notes",
+                value=str(f.get("notes") or ""),
+                height=110,
+                key=f"notes_{sel_year}",
+                placeholder="What stood out? Players, stories, memories…",
+            )
+
+            if st.button("Save", key=f"save_{sel_year}"):
+                try:
+                    save_flag(sb, user_id=user_id, year=sel_year, read=is_read, fav=is_fav, notes=notes)
+                    st.success("Saved.")
+                    # refresh flags
+                    flags = read_flags(sb, user_id=user_id)
+                except Exception as e:
+                    st.error(f"Could not save: {e}")
+
+        st.markdown("#### Season Snapshot")
+        snap = {
+            "Year": sel_year,
+            "Record": row.get("record", "—"),
+            "Win %": f"{float(row['win_pct']):.3f}" if pd.notna(row.get("win_pct")) else "—",
+            "Postseason": row.get("postseason", "—"),
+            "WSWin": row.get("WSWin", ""),
+            "LgWin": row.get("LgWin", ""),
+            "DivWin": row.get("DivWin", ""),
+            "WCWin": row.get("WCWin", ""),
+        }
+        st.write(snap)
+
+        st.divider()
+        display_articles_panel(sel_year)
+
+
+if __name__ == "__main__":
+    main()
