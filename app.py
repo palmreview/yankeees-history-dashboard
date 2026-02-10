@@ -287,7 +287,9 @@ def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
 # -----------------------------
 # Chronicling America articles (v0.8)
 # -----------------------------
-CHRONAM_BASE = "https://chroniclingamerica.loc.gov/search/pages/results/"
+CHRONAM_BASE = "https://www.loc.gov/collections/chronicling-america/"
+
+
 
 # ✅ PATCHED: safer JSON fetching with useful error messages
 def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
@@ -331,10 +333,11 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
     """
-    Searches Chronicling America pages for a year range (same year) and query terms.
-    Returns list of item dicts from the JSON response.
+    loc.gov JSON API for Chronicling America collection.
+    Returns a list of result dicts in data["results"].
     """
     query = (query or "").strip()
     if not query:
@@ -343,25 +346,20 @@ def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]
     rows = max(1, min(int(rows), 50))
 
     params = {
-        "dateFilterType": "yearRange",
-        "date1": str(year),
-        "date2": str(year),
-        "rows": str(rows),
-        "searchType": "advanced",
-        "format": "json",
-        "andtext": query,
+        "fo": "json",  # <-- forces JSON on loc.gov API
+        "c": str(rows),
+        "qs": query,
+        "start_date": f"{year}-01-01",
+        "end_date": f"{year}-12-31",
+        "dl": "page",  # request page-level results
     }
+
     url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
     data = _fetch_json(url)
-
-    items = data.get("items")
-    if isinstance(items, list):
-        return items
 
     results = data.get("results")
     if isinstance(results, list):
         return results
-
     return []
 
 
@@ -373,16 +371,23 @@ def pick_default_queries(year: int) -> List[str]:
 
 
 def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
-    date = str(item.get("date") or item.get("issue_date") or "")
-    paper = str(item.get("newspaper") or item.get("title") or item.get("publisher") or "Newspaper")
-    headline = str(item.get("headline") or item.get("place_of_publication") or "Newspaper page")
-    url = str(item.get("url") or item.get("id") or "")
-    snippet = str(item.get("snip") or item.get("snippet") or item.get("ocr_eng") or "")
+    # loc.gov results often include: title, date, url, snippet, description
+    date = str(item.get("date") or "")
+    title = str(item.get("title") or "Newspaper page")
+    url = str(item.get("url") or "")
+    snippet = str(item.get("snippet") or item.get("description") or "")
 
     if len(snippet) > 380:
         snippet = snippet[:380].rstrip() + "…"
 
-    return {"date": date, "paper": paper, "headline": headline, "url": url, "snippet": snippet}
+    return {
+        "date": date,
+        "paper": title,
+        "headline": title,
+        "url": url,
+        "snippet": snippet,
+    }
+
 
 
 def display_articles_panel(year: int):
