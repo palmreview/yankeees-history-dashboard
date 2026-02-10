@@ -1,24 +1,25 @@
 # Yankees History Timeline Dashboard
-# Version: 0.7 (adds Dynasty/Era Bands; preserves all v0.6 functionality)
+# Version: 0.8 (adds Season Stories; preserves all v0.7 functionality)
 # Date: 2026-02-10
 #
-# Preserved (v0.5/v0.6):
+# Preserved:
 # - Loads Lahman Teams.csv from repo root
 # - Seasons-first timeline with decade / start-year filters
 # - Season details view
 # - Optional Supabase persistence (read/favorite/notes) via user_season_flags
 # - Ring Counter (overall + in current filter)
+# - Dynasty/Era bands in timeline
 # - Safe slider (never crashes on small filtered sets)
 #
-# Added (v0.7):
-# - Dynasty/Era Bands in timeline (headers + subtle styling)
-# - Era legend (sidebar)
+# Added (v0.8):
+# - Season Stories (read + add) via Supabase table season_stories
+#   Fields: id(uuid), year(int), title(text), story(text), tags(text), source_url(text), created_at
 
 import os
 import pandas as pd
 import streamlit as st
 
-__version__ = "0.7"
+__version__ = "0.8"
 
 # -----------------------------
 # Optional Supabase
@@ -32,7 +33,7 @@ except Exception:
 
 
 # -----------------------------
-# Styling (Yankees vibe + Era styling)
+# Styling
 # -----------------------------
 def inject_css():
     st.markdown(
@@ -69,7 +70,6 @@ def inject_css():
           white-space: nowrap;
         }
 
-        .kpi-row { margin: 6px 0 14px 0; }
         .kpi {
           background: rgba(255,255,255,0.92);
           border: 1px solid rgba(12,35,64,0.18);
@@ -92,25 +92,15 @@ def inject_css():
         .era-title { font-weight: 900; letter-spacing: 0.2px; }
         .era-years { color: rgba(17,24,39,0.65); font-size: 0.9rem; margin-top: 2px; }
 
-        /* Era-specific subtle tints + left borders */
-        .era-pre  { background: rgba(12,35,64,0.06); border-left: 8px solid rgba(12,35,64,0.35); }
-        .era-ruth { background: rgba(12,35,64,0.08); border-left: 8px solid rgba(12,35,64,0.55); }
-        .era-dim  { background: rgba(12,35,64,0.07); border-left: 8px solid rgba(12,35,64,0.48); }
-        .era-mant { background: rgba(12,35,64,0.06); border-left: 8px solid rgba(12,35,64,0.40); }
-        .era-zoo  { background: rgba(12,35,64,0.05); border-left: 8px solid rgba(12,35,64,0.32); }
-        .era-lean { background: rgba(12,35,64,0.04); border-left: 8px solid rgba(12,35,64,0.26); }
-        .era-core { background: rgba(12,35,64,0.07); border-left: 8px solid rgba(12,35,64,0.52); }
-        .era-mod  { background: rgba(12,35,64,0.05); border-left: 8px solid rgba(12,35,64,0.34); }
-
-        /* Apply era tint to season cards too */
-        .season-era-pre  { border-left: 8px solid rgba(12,35,64,0.35); background: rgba(255,255,255,0.97); }
-        .season-era-ruth { border-left: 8px solid rgba(12,35,64,0.55); background: rgba(255,255,255,0.97); }
-        .season-era-dim  { border-left: 8px solid rgba(12,35,64,0.48); background: rgba(255,255,255,0.97); }
-        .season-era-mant { border-left: 8px solid rgba(12,35,64,0.40); background: rgba(255,255,255,0.97); }
-        .season-era-zoo  { border-left: 8px solid rgba(12,35,64,0.32); background: rgba(255,255,255,0.97); }
-        .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); background: rgba(255,255,255,0.97); }
-        .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); background: rgba(255,255,255,0.97); }
-        .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); background: rgba(255,255,255,0.97); }
+        /* Era-specific left borders */
+        .season-era-pre  { border-left: 8px solid rgba(12,35,64,0.35); }
+        .season-era-ruth { border-left: 8px solid rgba(12,35,64,0.55); }
+        .season-era-dim  { border-left: 8px solid rgba(12,35,64,0.48); }
+        .season-era-mant { border-left: 8px solid rgba(12,35,64,0.40); }
+        .season-era-zoo  { border-left: 8px solid rgba(12,35,64,0.32); }
+        .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); }
+        .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); }
+        .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); }
         </style>
         """,
         unsafe_allow_html=True,
@@ -132,10 +122,9 @@ def kpi_card(label: str, value: str, sub: str | None = None):
 
 
 # -----------------------------
-# Era Bands (v0.7)
+# Era Bands
 # -----------------------------
 ERAS = [
-    # key, label, start, end (inclusive), css_class
     ("pre",  "Early Years (Highlanders / pre-Ruth)", 1903, 1919, "pre"),
     ("ruth", "Ruth & Gehrig Era",                    1920, 1934, "ruth"),
     ("dim",  "DiMaggio Era",                         1936, 1951, "dim"),
@@ -150,18 +139,15 @@ def era_for_year(year: int) -> dict:
     for key, label, start, end, css in ERAS:
         if start <= year <= end:
             return {"key": key, "label": label, "start": start, "end": end, "css": css}
-    # fallback (covers gaps like 1935, 1965–1975, etc.)
     return {"key": "pre", "label": "Other Years", "start": year, "end": year, "css": "pre"}
 
 
 def render_era_header(era: dict):
-    css = era["css"]
-    label = era["label"]
     years = f"{era['start']}–{era['end']}" if era["start"] != era["end"] else f"{era['start']}"
     st.markdown(
         f"""
-        <div class="era-band era-{css}">
-          <div class="era-title">{label}</div>
+        <div class="era-band">
+          <div class="era-title">{era['label']}</div>
           <div class="era-years">{years}</div>
         </div>
         """,
@@ -255,9 +241,9 @@ def read_flags(sb, user_id: str) -> dict[int, dict]:
         return out
     except Exception as e:
         if "PGRST205" in str(e) or "Could not find the table" in str(e):
-            st.sidebar.warning("Supabase table `user_season_flags` not found yet. Create it to enable saving.")
+            st.sidebar.warning("Supabase table `user_season_flags` not found yet. Create it to enable saving flags.")
             return {}
-        st.sidebar.error(f"Supabase read error: {e}")
+        st.sidebar.error(f"Supabase read error (flags): {e}")
         return {}
 
 
@@ -274,6 +260,49 @@ def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
         },
         on_conflict="user_id,year",
     ).execute()
+
+
+# -----------------------------
+# Stories (v0.8)
+# -----------------------------
+def read_stories_for_year(sb, year: int) -> list[dict]:
+    if sb is None:
+        return []
+    try:
+        resp = (
+            sb.table("season_stories")
+            .select("id,year,title,story,tags,source_url,created_at")
+            .eq("year", int(year))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        if "PGRST205" in str(e) or "Could not find the table" in str(e):
+            st.warning("Stories table `season_stories` not found yet. Create it in Supabase to enable stories.")
+            return []
+        st.error(f"Supabase read error (stories): {e}")
+        return []
+
+
+def add_story(sb, year: int, title: str, story: str, tags: str, source_url: str):
+    if sb is None:
+        return
+    payload = {
+        "year": int(year),
+        "title": title.strip(),
+        "story": story.strip(),
+        "tags": tags.strip(),
+        "source_url": source_url.strip(),
+    }
+    sb.table("season_stories").insert(payload).execute()
+
+
+def normalize_tags(tags_str: str) -> list[str]:
+    if not tags_str:
+        return []
+    parts = [t.strip().lower() for t in tags_str.split(",")]
+    return [p for p in parts if p]
 
 
 # -----------------------------
@@ -298,10 +327,10 @@ def main():
         st.error("No Yankees seasons found (teamID='NYA'). Check your Teams.csv.")
         st.stop()
 
-    # Sidebar filters
     years_all = yank["yearID"].dropna().astype(int).tolist()
     min_year, max_year = min(years_all), max(years_all)
 
+    # Sidebar filters
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
@@ -312,10 +341,9 @@ def main():
     postseason_only = st.sidebar.checkbox("Postseason only", value=False)
     ws_only = st.sidebar.checkbox("World Series titles only", value=False)
 
-    # Era legend (v0.7)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Era bands")
-    for key, label, start, end, css in ERAS:
+    for _, label, start, end, _css in ERAS:
         st.sidebar.markdown(f"- **{label}** ({start}–{end})")
 
     # Apply filters
@@ -329,10 +357,7 @@ def main():
         filtered = filtered[filtered["postseason"] != "—"]
 
     if ws_only:
-        if "WSWin" in filtered.columns:
-            filtered = filtered[filtered["WSWin"] == "Y"]
-        else:
-            filtered = filtered.iloc[0:0]
+        filtered = filtered[filtered["WSWin"] == "Y"] if "WSWin" in filtered.columns else filtered.iloc[0:0]
 
     filtered = filtered.sort_values("yearID", ascending=False)
 
@@ -340,10 +365,9 @@ def main():
         st.warning("No seasons match filters.")
         return
 
-    # Ring Counter (overall + filtered)
+    # Ring counters
     overall_rings = int((yank["WSWin"] == "Y").sum()) if "WSWin" in yank.columns else 0
     filtered_rings = int((filtered["WSWin"] == "Y").sum()) if "WSWin" in filtered.columns else 0
-
     seasons_in_view = len(filtered)
     postseason_in_view = int((filtered["postseason"] != "—").sum())
 
@@ -355,7 +379,7 @@ def main():
     with c3:
         kpi_card("Seasons in view", f"{seasons_in_view}", f"Postseason seasons: {postseason_in_view}")
 
-    # Supabase + flags
+    # Supabase + persistence
     sb = get_supabase()
     user_id = "default_user"
     flags = read_flags(sb, user_id)
@@ -388,7 +412,7 @@ def main():
                 value=min(30, min(160, n)),
             )
 
-        # Render era bands + season cards (v0.7)
+        # Render era bands + season cards
         last_era_key = None
         for _, row in filtered.head(show_n).iterrows():
             year = int(row["yearID"])
@@ -430,8 +454,8 @@ def main():
     with right:
         year = int(st.session_state.selected_year)
         row = filtered[filtered["yearID"].astype(int) == year].iloc[0]
-
         era = era_for_year(year)
+
         st.subheader(f"{year} Season")
         st.caption(f"Era: **{era['label']}**")
 
@@ -439,21 +463,75 @@ def main():
         st.metric("Win %", row.get("win_pct", "—"))
         st.metric("Postseason", row.get("postseason", "—"))
 
+        # Flags/notes
+        st.markdown("---")
+        st.markdown("### Your flags & notes")
+
         existing = flags.get(year, {})
         read = st.checkbox("Read", value=bool(existing.get("is_read", False)))
         fav = st.checkbox("Favorite", value=bool(existing.get("is_favorite", False)))
-        notes = st.text_area("Notes", value=existing.get("notes", ""))
+        notes = st.text_area("Notes", value=existing.get("notes", ""), height=100)
 
         if sb is None:
             st.warning("Supabase not configured. Add SUPABASE_URL and SUPABASE_KEY in Streamlit Cloud secrets to enable saving.")
         else:
-            if st.button("Save"):
+            if st.button("Save flags/notes", use_container_width=True):
                 try:
                     save_flag(sb, user_id, year, read, fav, notes)
-                    st.success("Saved!")
+                    st.success("Saved flags/notes!")
                 except Exception as e:
                     st.error(f"Save failed: {e}")
 
+        # Stories (v0.8)
+        st.markdown("---")
+        st.markdown("### Stories")
+
+        stories = read_stories_for_year(sb, year) if sb is not None else []
+        all_tags = sorted({t for s in stories for t in normalize_tags(s.get("tags", ""))})
+
+        if stories:
+            tag_filter = st.selectbox("Filter by tag", ["All"] + all_tags, index=0)
+            for s in stories:
+                tags = normalize_tags(s.get("tags", ""))
+                if tag_filter != "All" and tag_filter.lower() not in tags:
+                    continue
+
+                with st.expander(s.get("title", "Untitled story"), expanded=False):
+                    st.write(s.get("story", ""))
+                    meta_bits = []
+                    if s.get("tags"):
+                        meta_bits.append(f"**Tags:** {s.get('tags')}")
+                    if s.get("source_url"):
+                        meta_bits.append(f"**Source:** {s.get('source_url')}")
+                    if meta_bits:
+                        st.markdown("  \n".join(meta_bits))
+        else:
+            st.info("No stories yet for this season. Add the first one below.")
+
+        # Add story form
+        st.markdown("#### Add a story")
+        with st.form(key="add_story_form", clear_on_submit=True):
+            title = st.text_input("Title", placeholder="e.g., 'Turning point season' or 'Iconic moment'")
+            story_text = st.text_area("Story (2–6 sentences)", height=140, placeholder="Write a short narrative. Keep it readable.")
+            tags = st.text_input("Tags (comma-separated)", placeholder="e.g., dynasty, rivalry, rookie, pitching")
+            source_url = st.text_input("Source URL (optional)", placeholder="Paste a link if you used one")
+            submitted = st.form_submit_button("Add story")
+
+        if submitted:
+            if sb is None:
+                st.error("Supabase isn’t configured yet, so stories can’t be saved.")
+            else:
+                if not title.strip() or not story_text.strip():
+                    st.error("Please enter at least a Title and Story.")
+                else:
+                    try:
+                        add_story(sb, year, title, story_text, tags, source_url)
+                        st.success("Story added!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not add story: {e}")
+
+    st.sidebar.markdown("---")
     st.sidebar.caption("Data: Lahman Teams.csv (repo root)")
 
 
