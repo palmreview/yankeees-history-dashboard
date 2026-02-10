@@ -371,10 +371,20 @@ def pick_default_queries(year: int) -> List[str]:
 
 
 def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
-    # loc.gov results often include: title, date, url, snippet, description
     date = str(item.get("date") or "")
+
     title = str(item.get("title") or "Newspaper page")
-    url = str(item.get("url") or "")
+
+    # Prefer human-facing URLs
+    url = ""
+    if isinstance(item.get("url"), str):
+        url = item["url"]
+    elif isinstance(item.get("aka"), list) and item["aka"]:
+        url = item["aka"][0]
+    elif isinstance(item.get("item_url"), str):
+        # fallback (less ideal, but clickable)
+        url = item["item_url"]
+
     snippet = str(item.get("snippet") or item.get("description") or "")
 
     if len(snippet) > 380:
@@ -387,6 +397,7 @@ def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
         "url": url,
         "snippet": snippet,
     }
+
 
 
 
