@@ -1,5 +1,5 @@
 # Yankees History Timeline Dashboard
-# Version: 0.8 (Season Articles 1903–1922 via Chronicling America; preserves all v0.7 functionality)
+# Version: 0.8 (Season Articles 1903–1922 via loc.gov Chronicling America collection; preserves v0.7 functionality)
 # Date: 2026-02-10
 #
 # Preserved:
@@ -11,12 +11,15 @@
 # - Dynasty/Era bands in timeline
 # - Safe selection (never crashes on small filtered sets)
 #
-# Added (v0.8):
-# - "Articles" panel that auto-fetches historical newspaper pages for seasons 1903–1922
-#   using Chronicling America search results JSON and shows snippet + link.
+# Added / Improved (v0.8):
+# - "Articles" panel that fetches historical newspaper pages for seasons 1903–1922
+#   using the loc.gov JSON API for the Chronicling America collection
+# - Clickable hyperlinks (no copy/paste URLs)
+# - Better baseball-specific preset queries
+# - Relevance filter toggle (default ON) to reduce non-team/off-topic results
 
 import json
-import os
+import re
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
@@ -118,7 +121,7 @@ def inject_css():
           box-shadow: 0 6px 18px rgba(17,24,39,0.04);
         }
         .article-title { font-weight: 800; }
-        .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 2px; }
+        .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 4px; }
         .article-snippet { margin-top: 8px; color: rgba(17,24,39,0.85); }
 
         .small-note { color: rgba(17,24,39,0.65); font-size: 0.9rem; }
@@ -285,14 +288,40 @@ def save_flag(sb, user_id: str, year: int, read: bool, fav: bool, notes: str):
 
 
 # -----------------------------
-# Chronicling America articles (v0.8)
+# Articles (loc.gov Chronicling America collection)
 # -----------------------------
+# loc.gov JSON API base for Chronicling America collection
 CHRONAM_BASE = "https://www.loc.gov/collections/chronicling-america/"
 
+BASEBALL_TERMS = [
+    "baseball",
+    "american league",
+    "national league",
+    "world series",
+    "box score",
+    "boxscore",
+    "innings",
+    "pitcher",
+    "pitching",
+    "batted",
+    "batting",
+    "home run",
+    "homered",
+    "doubleheader",
+    "ball club",
+    "ballclub",
+    "diamond",
+    "runs",
+    "hits",
+    "rbi",
+]
+
+TEAM_TERMS_PRE1913 = ["highlanders", "new york highlanders"]
+TEAM_TERMS_POST1912 = ["yankees", "new york yankees"]
 
 
-# ✅ PATCHED: safer JSON fetching with useful error messages
 def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
+    """Robust JSON fetcher with helpful errors if upstream returns HTML or empty content."""
     req = urllib.request.Request(
         url,
         headers={
@@ -308,15 +337,14 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
             raw_bytes = resp.read()
 
         text = raw_bytes.decode("utf-8", errors="replace").strip()
-
         if not text:
-            raise RuntimeError(f"Chronicling America returned an empty response (HTTP {status}).")
+            raise RuntimeError(f"Empty response (HTTP {status}).")
 
+        # loc.gov should return JSON when fo=json; if not, show a preview
         if "json" not in ctype and not text.lstrip().startswith("{"):
             preview = text[:220].replace("\n", " ").replace("\r", " ")
             raise RuntimeError(
-                f"Chronicling America did not return JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). "
-                f"Preview: {preview}"
+                f"Did not return JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). Preview: {preview}"
             )
 
         try:
@@ -324,8 +352,7 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
         except json.JSONDecodeError:
             preview = text[:220].replace("\n", " ").replace("\r", " ")
             raise RuntimeError(
-                f"Invalid JSON from Chronicling America (HTTP {status}, Content-Type: {ctype or 'unknown'}). "
-                f"Preview: {preview}"
+                f"Invalid JSON (HTTP {status}, Content-Type: {ctype or 'unknown'}). Preview: {preview}"
             )
 
     except Exception as e:
@@ -333,11 +360,10 @@ def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
 
 
 @st.cache_data(show_spinner=False)
-@st.cache_data(show_spinner=False)
-def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
+def chronam_search_locgov(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]]:
     """
-    loc.gov JSON API for Chronicling America collection.
-    Returns a list of result dicts in data["results"].
+    Searches loc.gov Chronicling America collection for a given year and query.
+    Returns list of result dicts in data["results"].
     """
     query = (query or "").strip()
     if not query:
@@ -346,12 +372,13 @@ def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]
     rows = max(1, min(int(rows), 50))
 
     params = {
-        "fo": "json",  # <-- forces JSON on loc.gov API
+        "fo": "json",  # force JSON
         "c": str(rows),
         "qs": query,
         "start_date": f"{year}-01-01",
         "end_date": f"{year}-12-31",
-        "dl": "page",  # request page-level results
+        # "dl=page" tends to favor page-level results (works well for OCR snippets)
+        "dl": "page",
     }
 
     url = CHRONAM_BASE + "?" + urllib.parse.urlencode(params, doseq=True)
@@ -364,10 +391,48 @@ def chronam_search(year: int, query: str, rows: int = 20) -> List[Dict[str, Any]
 
 
 def pick_default_queries(year: int) -> List[str]:
-    # 1903–1912: "Highlanders" often used
+    """
+    Baseball-specific preset searches to reduce off-topic 'yankees' matches.
+    Quotes are intentional to tighten results.
+    """
     if year <= 1912:
-        return ["highlanders", "new york highlanders", "yankees"]
-    return ["yankees", "new york yankees", "baseball yankees"]
+        return [
+            '"New York Highlanders" baseball',
+            'highlanders baseball "American League"',
+            '"American League" Highlanders baseball',
+            '"New York" Highlanders baseball box score',
+        ]
+    return [
+        '"New York Yankees" baseball',
+        'yankees baseball "American League"',
+        '"New York Yankees" "box score"',
+        '"New York Yankees" "American League" baseball',
+    ]
+
+
+def _best_public_url(item: Dict[str, Any]) -> str:
+    """
+    loc.gov results may include:
+      - url (often human-facing)
+      - aka (list of alternate stable URLs, often best)
+      - item_url (API URL, fallback)
+    We prefer a clickable, human-friendly URL.
+    """
+    url = ""
+    v = item.get("url")
+    if isinstance(v, str) and v.strip():
+        url = v.strip()
+
+    aka = item.get("aka")
+    if (not url) and isinstance(aka, list) and aka:
+        if isinstance(aka[0], str) and aka[0].strip():
+            url = aka[0].strip()
+
+    item_url = item.get("item_url")
+    if (not url) and isinstance(item_url, str) and item_url.strip():
+        url = item_url.strip()
+
+    return url
 
 
 def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
@@ -375,20 +440,13 @@ def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
 
     title = str(item.get("title") or "Newspaper page")
 
-    # Prefer human-facing URLs
-    url = ""
-    if isinstance(item.get("url"), str):
-        url = item["url"]
-    elif isinstance(item.get("aka"), list) and item["aka"]:
-        url = item["aka"][0]
-    elif isinstance(item.get("item_url"), str):
-        # fallback (less ideal, but clickable)
-        url = item["item_url"]
+    url = _best_public_url(item)
 
+    # loc.gov can provide snippet/description; snippet is best when present
     snippet = str(item.get("snippet") or item.get("description") or "")
 
-    if len(snippet) > 380:
-        snippet = snippet[:380].rstrip() + "…"
+    if len(snippet) > 420:
+        snippet = snippet[:420].rstrip() + "…"
 
     return {
         "date": date,
@@ -399,16 +457,40 @@ def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _text_blob_for_relevance(item: Dict[str, Any]) -> str:
+    parts = [
+        str(item.get("title") or ""),
+        str(item.get("snippet") or ""),
+        str(item.get("description") or ""),
+    ]
+    return " ".join(parts).lower()
+
+
+def is_baseball_team_relevant(item: Dict[str, Any], year: int) -> bool:
+    """
+    Heuristic filter:
+      - Must include at least one baseball context term
+      - Must include team identifier for the period (Highlanders early, Yankees later)
+    """
+    blob = _text_blob_for_relevance(item)
+
+    # Baseball context required
+    if not any(t in blob for t in BASEBALL_TERMS):
+        return False
+
+    # Team identifier required
+    team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
+    if not any(t in blob for t in team_terms):
+        return False
+
+    return True
 
 
 def display_articles_panel(year: int):
     st.markdown("### Articles (1903–1922)")
 
     if year < 1903 or year > 1922:
-        st.info(
-            "Articles are enabled for **1903–1922** right now. "
-            "(We’ll expand later once we pick the next archive source.)"
-        )
+        st.info("Articles are enabled for **1903–1922** right now. (We’ll expand later.)")
         return
 
     defaults = pick_default_queries(year)
@@ -417,24 +499,34 @@ def display_articles_panel(year: int):
     custom = st.text_input(
         "Add/override search terms (optional)",
         value="",
-        help="Tip: keep it short (e.g., 'highlanders' or 'babe ruth').",
+        help='Tip: try quotes, e.g. "New York Yankees" baseball or "Highlanders" box score.',
     )
     query = custom.strip() if custom.strip() else preset
 
-    rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
+    colA, colB = st.columns([1, 1])
+    with colA:
+        rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
+    with colB:
+        strict = st.checkbox("Only show baseball/team-relevant results", value=True)
 
     with st.spinner("Searching newspaper pages…"):
         try:
-            items = chronam_search(year, query=query, rows=rows)
+            items = chronam_search_locgov(year, query=query, rows=rows)
         except Exception as e:
             st.error(f"Could not fetch articles: {e}")
             return
 
+    if strict:
+        items = [it for it in items if is_baseball_team_relevant(it, year)]
+
     if not items:
-        st.warning("No results found for that query. Try different terms.")
+        if strict:
+            st.warning("No baseball/team-relevant results found. Try a different term, remove quotes, or toggle strict off.")
+        else:
+            st.warning("No results found for that query. Try different terms.")
         return
 
-    st.caption("Results are digitized newspaper *pages* with OCR snippets. Click through to view the scan.")
+    st.caption("These are digitized newspaper pages with OCR snippets. Click the link to view the scan on Library of Congress.")
 
     for it in items:
         a = normalize_article_item(it)
@@ -443,14 +535,19 @@ def display_articles_panel(year: int):
         url = a["url"]
         snippet = a["snippet"] or ""
 
-        top_line = f"{date} • {paper}"
-        link = f"[Open page]({url})" if url else ""
+        # Clickable link (no copy/paste)
+        if url:
+            top_line = f"[{date} • {paper}]({url})"
+            link_line = f"🔗 [View newspaper page]({url})"
+        else:
+            top_line = f"{date} • {paper}"
+            link_line = "<i>No link available for this result.</i>"
 
         st.markdown(
             f"""
             <div class="article-card">
               <div class="article-title">{top_line}</div>
-              <div class="article-meta">{link}</div>
+              <div class="article-meta">{link_line}</div>
               <div class="article-snippet">{snippet if snippet else "<i>No OCR snippet available.</i>"}</div>
             </div>
             """,
@@ -512,7 +609,6 @@ def render_season_card(row: pd.Series, flags: Optional[dict] = None):
             notes_hint = " 📝 Notes"
 
     pills = season_pills(row)
-
     marker_text = (read_mark + fav_mark + notes_hint).strip()
     marker_html = f"<span class='pill'>{marker_text}</span>" if marker_text else ""
 
@@ -584,20 +680,18 @@ def main():
 
     # Sidebar filters
     years_all = yank["yearID"].dropna().astype(int).tolist()
-    years_all_desc = sorted(years_all, reverse=True)
     min_year, max_year = min(years_all), max(years_all)
 
     st.sidebar.header("Filters")
     start_year = st.sidebar.slider("Start year", min_year, max_year, min_year)
 
-    # Decades
+    # Decades (FIXED: no truncation / syntax hazards)
     try:
         years_for_decades = [int(y) for y in years_all if y is not None]
     except Exception:
         years_for_decades = []
 
     decade_starts = sorted({(y // 10) * 10 for y in years_for_decades}) if years_for_decades else []
-
     selected_decades = st.sidebar.multiselect(
         "Decades (optional)",
         options=decade_starts,
