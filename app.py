@@ -1,6 +1,6 @@
 # Yankees History Timeline Dashboard
-# Version: 0.8.3 (Better newspaper search: proximity ops + shorter presets; preserves all existing functionality)
-# Date: 2026-02-10
+# Version: 0.8.5 (Streamlit-native clickable links + team-first article search + baseball scoring filter)
+# Date: 2026-02-11
 #
 # Preserved:
 # - Loads Lahman Teams.csv from repo root
@@ -10,23 +10,23 @@
 # - Ring Counter (overall + in current filter)
 # - Dynasty/Era bands in timeline
 # - Safe selection (never crashes on small filtered sets)
-# - Articles panel via loc.gov Chronicling America collection (clickable links)
 #
-# Updated (v0.8.3):
-# - Default search mode is proximity (~10) for noisy OCR
-# - Presets are shorter / more OCR-tolerant (e.g., "yankees base ball")
-# - Strict filtering is optional and won’t zero results silently
-# - Debug expander shows request URL + total results returned by API
+# Updated (v0.8.5):
+# - Articles now render links using Streamlit-native st.link_button() (guaranteed clickable)
+# - Default searches are team-only (Highlanders/Yankees) to avoid over-restricting loc.gov
+# - Adds "Minimum baseball signals" slider to locally filter/boost baseball-relevant pages
+# - Keeps debug expander for request URL + result counts
+# - Keeps optional NY facet + search mode selector
 
 import json
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-__version__ = "0.8.3"
+__version__ = "0.8.5"
 
 # -----------------------------
 # Optional Supabase
@@ -109,18 +109,6 @@ def inject_css():
         .season-era-lean { border-left: 8px solid rgba(12,35,64,0.26); }
         .season-era-core { border-left: 8px solid rgba(12,35,64,0.52); }
         .season-era-mod  { border-left: 8px solid rgba(12,35,64,0.34); }
-
-        .article-card {
-          border: 1px solid rgba(12,35,64,0.14);
-          border-radius: 14px;
-          padding: 12px 12px;
-          margin: 10px 0;
-          background: rgba(255,255,255,0.95);
-          box-shadow: 0 6px 18px rgba(17,24,39,0.04);
-        }
-        .article-title { font-weight: 800; }
-        .article-meta { color: rgba(17,24,39,0.68); font-size: 0.90rem; margin-top: 4px; }
-        .article-snippet { margin-top: 8px; color: rgba(17,24,39,0.85); }
 
         .small-note { color: rgba(17,24,39,0.65); font-size: 0.9rem; }
         </style>
@@ -316,24 +304,15 @@ BASEBALL_TERMS = [
     "rbi",
 ]
 
-TEAM_TERMS_PRE1913 = [
-    "highlanders",
-    "new york highlanders",
-    # occasional shorthand / OCR weirdness:
-    "n.y. highlanders",
-]
-TEAM_TERMS_POST1912 = [
-    "yankees",
-    "new york yankees",
-    "n.y. yankees",
-]
+TEAM_TERMS_PRE1913 = ["highlanders", "new york highlanders", "n.y. highlanders"]
+TEAM_TERMS_POST1912 = ["yankees", "new york yankees", "n.y. yankees"]
 
 
 def _fetch_json(url: str, timeout_sec: int = 15) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8.3)",
+            "User-Agent": "Mozilla/5.0 (compatible; YankeesHistoryDashboard/0.8.5)",
             "Accept": "application/json,text/javascript,*/*;q=0.1",
         },
     )
@@ -366,12 +345,6 @@ def chronam_search_locgov(
     ops: str = "~10",
     state: str | None = None,
 ) -> Dict[str, Any]:
-    """
-    Returns a dict with:
-      - results: list
-      - total: int (if available)
-      - request_url: str
-    """
     query = (query or "").strip()
     if not query:
         return {"results": [], "total": 0, "request_url": ""}
@@ -406,21 +379,11 @@ def chronam_search_locgov(
     return {"results": results, "total": total, "request_url": request_url}
 
 
+# ✅ NEW defaults: TEAM-ONLY (do NOT include "base ball" here)
 def pick_default_queries(year: int) -> List[str]:
-    # Short + tolerant = more hits, then we sort by baseball-likeness
     if year <= 1912:
-        return [
-            "highlanders base ball",
-            "highlanders box score",
-            "highlanders american league",
-            "new york highlanders base ball",
-        ]
-    return [
-        "yankees base ball",
-        "yankees box score",
-        "yankees american league",
-        "new york yankees base ball",
-    ]
+        return ["highlanders", "new york highlanders", "n.y. highlanders"]
+    return ["yankees", "new york yankees", "n.y. yankees"]
 
 
 def _best_public_url(item: Dict[str, Any]) -> str:
@@ -453,23 +416,21 @@ def normalize_article_item(item: Dict[str, Any]) -> Dict[str, str]:
     return {"date": date, "paper": title, "url": url, "snippet": snippet}
 
 
-def _text_blob_for_scoring(item: Dict[str, Any]) -> str:
-    # Keep scoring broad, not just snippet
-    parts = [
-        str(item.get("snippet") or ""),
-        str(item.get("description") or ""),
-        str(item.get("title") or ""),
-    ]
-    return " ".join(parts).lower()
+def _text_blob(item: Dict[str, Any]) -> str:
+    return (
+        (str(item.get("snippet") or "") + " " + str(item.get("description") or "") + " " + str(item.get("title") or ""))
+        .lower()
+        .strip()
+    )
 
 
 def baseball_score(item: Dict[str, Any]) -> int:
-    blob = _text_blob_for_scoring(item)
+    blob = _text_blob(item)
     return sum(1 for t in BASEBALL_TERMS if t in blob)
 
 
 def team_score(item: Dict[str, Any], year: int) -> int:
-    blob = _text_blob_for_scoring(item)
+    blob = _text_blob(item)
     team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
     return sum(1 for t in team_terms if t in blob)
 
@@ -487,28 +448,30 @@ def display_articles_panel(year: int):
     custom = st.text_input(
         "Add/override search terms (optional)",
         value="",
-        help='Tip: keep it short. Great add-ons: "box score", "american league", "base ball".',
+        help='Tip: start with team-only. Then try add-ons like: "box score", "american league", "base ball".',
     )
     query = custom.strip() if custom.strip() else preset
 
-    colA, colB, colC = st.columns([1, 1, 1])
+    colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
-        rows = st.slider("Results to fetch", min_value=10, max_value=50, value=20, step=10)
+        rows = st.slider("Results to fetch", min_value=10, max_value=50, value=50, step=10)
     with colB:
         ops = st.selectbox(
             "Search mode",
-            ["~10", "~5", "AND", "PHRASE", "OR"],
+            ["OR", "~10", "~5", "AND", "PHRASE"],
             index=0,
-            help="~10/~5 = words near each other (best for OCR); AND = all words; PHRASE = exact; OR = any word.",
+            help="OR is broad (best first pass). ~10/~5 keeps words near each other. AND/PHRASE are stricter.",
         )
     with colC:
         ny_only = st.checkbox("Prefer New York papers", value=False, help="Facet filter that reduces noise.")
-
-    # Important change: strict filter is optional and defaults OFF
-    strict_filter = st.checkbox(
-        "Strict filter: require snippet mentions team name (may hide good results)",
-        value=False,
-    )
+    with colD:
+        min_hits = st.slider(
+            "Min baseball signals",
+            min_value=0,
+            max_value=8,
+            value=2,
+            help="Filters results locally based on baseball words in snippet/description.",
+        )
 
     state = "new york" if ny_only else None
 
@@ -530,32 +493,31 @@ def display_articles_panel(year: int):
 
     if not items:
         st.warning(
-            "No results from the API for that query. Try:\n"
-            "- switching Search mode to OR\n"
-            "- removing words (keep 2–3 words)\n"
-            "- using 'yankees box score' or 'highlanders box score'\n"
-            "- turning off 'Prefer New York papers'\n"
+            "No results returned by the API for that query.\n\n"
+            "Try:\n"
+            "- Search mode = OR\n"
+            "- Removing extra words (keep it short)\n"
+            "- Turning off 'Prefer New York papers'\n"
         )
         return
 
-    # Sort best-first: team hits first, then baseball-likeness
-    items.sort(key=lambda it: (team_score(it, year), baseball_score(it)), reverse=True)
+    # Rank best-first: team hits first, then baseball-likeness
+    scored = []
+    for it in items:
+        scored.append((team_score(it, year), baseball_score(it), it))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    if strict_filter:
-        # Only filter if it won't wipe out the list
-        team_terms = TEAM_TERMS_PRE1913 if year <= 1912 else TEAM_TERMS_POST1912
-        def has_team_in_snippet(it: Dict[str, Any]) -> bool:
-            sn = (str(it.get("snippet") or "") + " " + str(it.get("description") or "")).lower()
-            return any(t in sn for t in team_terms)
+    # Apply local baseball filter, but never wipe everything
+    filtered = [it for t, b, it in scored if b >= int(min_hits)]
+    if filtered:
+        items = filtered
+    else:
+        st.info("Min baseball signals removed everything; showing top-ranked results instead.")
+        items = [it for _, _, it in scored[:20]]
 
-        filtered = [it for it in items if has_team_in_snippet(it)]
-        if filtered:
-            items = filtered
-        else:
-            st.info("Strict filter would remove everything (snippets are short). Showing best-ranked results instead.")
+    st.caption("Digitized newspaper pages with OCR snippets. Use the button to open the page (always clickable).")
 
-    st.caption("Digitized newspaper pages with OCR snippets. Click to open on Library of Congress.")
-
+    # ✅ STREAMLIT-NATIVE RENDERING: links always clickable
     for it in items:
         a = normalize_article_item(it)
         date = a["date"] or "Unknown date"
@@ -563,23 +525,20 @@ def display_articles_panel(year: int):
         url = a["url"]
         snippet = a["snippet"] or ""
 
-        if url:
-            top_line = f"[{date} • {paper}]({url})"
-            link_line = f"🔗 [View newspaper page]({url})"
-        else:
-            top_line = f"{date} • {paper}"
-            link_line = "<i>No link available for this result.</i>"
+        with st.container(border=True):
+            st.write(f"**{date} • {paper}**")
 
-        st.markdown(
-            f"""
-            <div class="article-card">
-              <div class="article-title">{top_line}</div>
-              <div class="article-meta">{link_line}</div>
-              <div class="article-snippet">{snippet if snippet else "<i>No OCR snippet available.</i>"}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            cols = st.columns([0.65, 0.35])
+            with cols[0]:
+                if snippet:
+                    st.write(snippet)
+                else:
+                    st.caption("No OCR snippet available.")
+            with cols[1]:
+                if url:
+                    st.link_button("Open newspaper page", url)
+                else:
+                    st.caption("No link available.")
 
 
 # -----------------------------
